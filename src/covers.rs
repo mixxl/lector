@@ -8,11 +8,12 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 pub struct CoverResult {
     pub path: String,
     pub image: Option<ColorImage>,
-    pub meta: Option<(String, String)>,
+    pub meta: Option<crate::epub::Info>,
+    pub meta_only: bool,
 }
 
 pub struct CoverWorker {
-    tx: Sender<(String, bool)>,
+    tx: Sender<(String, bool, bool)>,
     pub rx: Receiver<CoverResult>,
 }
 
@@ -40,25 +41,47 @@ fn to_color_image(img: image::RgbaImage) -> ColorImage {
     ColorImage::from_rgba_unmultiplied(size, img.as_raw())
 }
 
-fn make_cover(path: &str) -> (Option<image::RgbaImage>, Option<(String, String)>) {
+fn make_meta(path: &str) -> Option<crate::epub::Info> {
+    let p = Path::new(path);
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+        let data = std::fs::read(p).ok()?;
+        let title = crate::pdfdoc::title(&data).unwrap_or_default();
+        Some(crate::epub::Info {
+            title,
+            author: String::new(),
+            subjects: vec![],
+        })
+    } else {
+        crate::epub::quick_info(p).map(|(i, _)| i)
+    }
+}
+
+fn make_cover(path: &str) -> (Option<image::RgbaImage>, Option<crate::epub::Info>) {
     let p = Path::new(path);
     let is_pdf = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
     if is_pdf {
         let Ok(data) = std::fs::read(p) else {
             return (None, None);
         };
-        let title = crate::pdfdoc::title(&data);
+        let title = crate::pdfdoc::title(&data).unwrap_or_default();
         let img = crate::pdfdoc::thumbnail(data, THUMB_W as f32)
             .and_then(|(w, h, rgba)| image::RgbaImage::from_raw(w as u32, h as u32, rgba));
-        (img, title.map(|t| (t, String::new())))
+        (
+            img,
+            Some(crate::epub::Info {
+                title,
+                author: String::new(),
+                subjects: vec![],
+            }),
+        )
     } else {
-        let Some((title, author, cover)) = crate::epub::quick_info(p) else {
+        let Some((info, cover)) = crate::epub::quick_info(p) else {
             return (None, None);
         };
         let img = cover
             .and_then(|b| image::load_from_memory(&b).ok())
             .map(|i| i.thumbnail(THUMB_W, THUMB_W * 2).to_rgba8());
-        (img, Some((title, author)))
+        (img, Some(info))
     }
 }
 
@@ -66,11 +89,10 @@ fn process(path: &str, need_meta: bool) -> CoverResult {
     let cf = cache_file(path);
     let cached = cf
         .as_ref()
-        .filter(|_| !need_meta)
         .and_then(|f| image::open(f).ok())
         .map(|i| i.to_rgba8());
     let (img, meta) = match cached {
-        Some(i) => (Some(i), None),
+        Some(i) => (Some(i), if need_meta { make_meta(path) } else { None }),
         None => {
             let (img, meta) = make_cover(path);
             if let (Some(i), Some(f)) = (&img, &cf) {
@@ -83,12 +105,13 @@ fn process(path: &str, need_meta: bool) -> CoverResult {
         path: path.to_string(),
         image: img.map(to_color_image),
         meta,
+        meta_only: false,
     }
 }
 
 impl CoverWorker {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, req) = channel::<(String, bool)>();
+        let (tx, req) = channel::<(String, bool, bool)>();
         let req = std::sync::Arc::new(std::sync::Mutex::new(req));
         let (res, rx) = channel();
         let threads = std::thread::available_parallelism()
@@ -102,14 +125,27 @@ impl CoverWorker {
             std::thread::spawn(move || {
                 loop {
                     let msg = req.lock().ok().and_then(|r| r.recv().ok());
-                    let Some((path, need_meta)) = msg else { return };
-                    let r = std::panic::catch_unwind(|| process(&path, need_meta)).unwrap_or(
-                        CoverResult {
-                            path: path.clone(),
-                            image: None,
-                            meta: None,
-                        },
-                    );
+                    let Some((path, need_meta, meta_only)) = msg else {
+                        return;
+                    };
+                    let r = std::panic::catch_unwind(|| {
+                        if meta_only {
+                            CoverResult {
+                                path: path.clone(),
+                                image: None,
+                                meta: make_meta(&path),
+                                meta_only: true,
+                            }
+                        } else {
+                            process(&path, need_meta)
+                        }
+                    })
+                    .unwrap_or(CoverResult {
+                        path: path.clone(),
+                        image: None,
+                        meta: None,
+                        meta_only,
+                    });
                     if res.send(r).is_err() {
                         return;
                     }
@@ -121,7 +157,11 @@ impl CoverWorker {
     }
 
     pub fn request(&self, path: &str, need_meta: bool) {
-        let _ = self.tx.send((path.to_string(), need_meta));
+        let _ = self.tx.send((path.to_string(), need_meta, false));
+    }
+
+    pub fn request_meta(&self, path: &str) {
+        let _ = self.tx.send((path.to_string(), true, true));
     }
 }
 

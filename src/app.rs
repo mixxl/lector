@@ -61,6 +61,72 @@ pub struct Entry {
     pub added: u64,
     pub meta_done: bool,
     pub bookmarks: Vec<(usize, usize)>,
+    /// temas del libro (dc:subject)
+    pub subjects: Vec<String>,
+    /// colecciones del usuario
+    pub collections: Vec<String>,
+    pub finished: bool,
+    pub meta_v: u8,
+}
+
+impl Entry {
+    fn is_finished(&self) -> bool {
+        self.finished || self.progress >= 0.995
+    }
+    fn is_reading(&self) -> bool {
+        self.opened && !self.is_finished()
+    }
+    fn author_name(&self) -> &str {
+        if self.author.trim().is_empty() {
+            "Autor desconocido"
+        } else {
+            self.author.trim()
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum Filter {
+    Todo,
+    Leyendo,
+    ParaLeer,
+    Terminados,
+    Libros,
+    Pdf,
+    Autores,
+    Autor(String),
+    Temas,
+    Tema(String),
+    Coleccion(String),
+}
+
+impl Filter {
+    fn title(&self) -> String {
+        match self {
+            Filter::Todo => "Todo".into(),
+            Filter::Leyendo => "Leyendo".into(),
+            Filter::ParaLeer => "Para leer".into(),
+            Filter::Terminados => "Terminados".into(),
+            Filter::Libros => "Libros".into(),
+            Filter::Pdf => "PDF".into(),
+            Filter::Autores => "Autores".into(),
+            Filter::Temas => "Temas".into(),
+            Filter::Autor(a) | Filter::Tema(a) | Filter::Coleccion(a) => a.clone(),
+        }
+    }
+    fn matches(&self, e: &Entry) -> bool {
+        match self {
+            Filter::Todo | Filter::Autores | Filter::Temas => true,
+            Filter::Leyendo => e.is_reading(),
+            Filter::ParaLeer => !e.opened && !e.is_finished(),
+            Filter::Terminados => e.is_finished(),
+            Filter::Libros => !e.is_pdf,
+            Filter::Pdf => e.is_pdf,
+            Filter::Autor(a) => e.author_name() == a,
+            Filter::Tema(t) => e.subjects.iter().any(|s| s == t),
+            Filter::Coleccion(c) => e.collections.iter().any(|s| s == c),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -68,6 +134,8 @@ pub struct Entry {
 struct Saved {
     settings: Settings,
     library: Vec<Entry>,
+    collections: Vec<String>,
+    sort: u8,
 }
 
 fn now() -> u64 {
@@ -140,6 +208,9 @@ pub struct App {
     message: Option<(String, f64)>,
     initial: Vec<String>,
     cover_editor: Option<CoverEditor>,
+    filter: Filter,
+    new_collection: Option<String>,
+    meta_requested: HashSet<String>,
 }
 
 struct CoverEditor {
@@ -192,6 +263,9 @@ impl App {
             message: None,
             initial,
             cover_editor: None,
+            filter: Filter::Todo,
+            new_collection: None,
+            meta_requested: HashSet::new(),
         }
     }
 
@@ -381,9 +455,24 @@ impl eframe::App for App {
             self.grain = Some(ctx.load_texture("grano", book::grain_image(256), opts));
         }
         // archivos por línea de comandos
-        for p in std::mem::take(&mut self.initial) {
-            if let Some(i) = self.add_path(Path::new(&p)) {
+        // archivos o carpetas por línea de comandos: uno solo se abre, varios se añaden
+        let initial = std::mem::take(&mut self.initial);
+        let mut books = Vec::new();
+        for p in &initial {
+            let p = PathBuf::from(p);
+            if p.is_dir() && !p.to_string_lossy().to_lowercase().ends_with(".epub") {
+                covers::scan(&p, &mut books, 0);
+            } else {
+                books.push(p);
+            }
+        }
+        if books.len() == 1 && initial.len() == 1 {
+            if let Some(i) = self.add_path(&books[0]) {
                 self.open(&ctx, i);
+            }
+        } else if !books.is_empty() {
+            for b in &books {
+                self.add_path(b);
             }
         }
         // arrastrar y soltar
@@ -415,15 +504,20 @@ impl eframe::App for App {
         // resultados de portadas
         while let Ok(r) = self.covers.rx.try_recv() {
             if let Some(e) = self.saved.library.iter_mut().find(|e| e.path == r.path) {
-                if let Some((t, a)) = r.meta {
-                    if !t.is_empty() {
-                        e.title = t;
+                if let Some(info) = r.meta {
+                    if !info.title.is_empty() && (!e.meta_done || e.meta_v < 2) {
+                        e.title = info.title;
                     }
-                    if !a.is_empty() {
-                        e.author = a;
+                    if !info.author.is_empty() {
+                        e.author = info.author;
                     }
+                    e.subjects = info.subjects;
+                    e.meta_v = 2;
                 }
                 e.meta_done = true;
+            }
+            if r.meta_only {
+                continue;
             }
             let tex = r.image.map(|img| {
                 ctx.load_texture(format!("portada:{}", r.path), img, TextureOptions::LINEAR)
@@ -473,18 +567,235 @@ impl App {
         let mut do_folder = false;
         let mut do_apple = false;
 
-        egui::Panel::top("cabecera")
+        let bg = Color32::from_rgb(250, 249, 247);
+        let side_bg = Color32::from_rgb(236, 234, 230);
+        let ink = Color32::from_rgb(30, 30, 30);
+
+        // ---- recuentos
+        let lib = &self.saved.library;
+        let count = |f: &Filter| lib.iter().filter(|e| f.matches(e)).count();
+        let mut subjects: HashMap<String, usize> = HashMap::new();
+        let mut authors: HashMap<String, usize> = HashMap::new();
+        for e in lib {
+            for t in &e.subjects {
+                *subjects.entry(t.clone()).or_default() += 1;
+            }
+            *authors.entry(e.author_name().to_string()).or_default() += 1;
+        }
+        let mut subj_sorted: Vec<(String, usize)> = subjects.into_iter().collect();
+        subj_sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut auth_sorted: Vec<(String, usize)> = authors.into_iter().collect();
+        auth_sorted.sort_by(|a, b| sort_key(&a.0).cmp(&sort_key(&b.0)));
+        let mut collections = self.saved.collections.clone();
+        for e in lib {
+            for c in &e.collections {
+                if !collections.contains(c) {
+                    collections.push(c.clone());
+                }
+            }
+        }
+        collections.sort_by_key(|c| sort_key(c));
+        let n_total = lib.len();
+        let counts = [
+            count(&Filter::Leyendo),
+            count(&Filter::ParaLeer),
+            count(&Filter::Terminados),
+            count(&Filter::Libros),
+            count(&Filter::Pdf),
+        ];
+        let coll_counts: Vec<usize> = collections
+            .iter()
+            .map(|c| lib.iter().filter(|e| e.collections.contains(c)).count())
+            .collect();
+
+        // ---- menú lateral
+        let mut new_filter: Option<Filter> = None;
+        let mut delete_collection: Option<String> = None;
+        let current = self.filter.clone();
+        egui::Panel::left("menu")
+            .resizable(false)
+            .exact_size(230.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(250, 249, 247))
-                    .inner_margin(egui::Margin::symmetric(28, 18)),
+                    .fill(side_bg)
+                    .inner_margin(egui::Margin::symmetric(12, 14)),
             )
             .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Buscar título, autor o tema")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let mut row = |ui: &mut egui::Ui,
+                                       f: Filter,
+                                       label: &str,
+                                       n: usize|
+                         -> egui::Response {
+                            let sel = current == f;
+                            let (rect, r) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 26.0),
+                                Sense::click(),
+                            );
+                            let p = ui.painter();
+                            if sel {
+                                p.rect_filled(rect, 6.0, Color32::from_rgb(214, 211, 206));
+                            } else if r.hovered() {
+                                p.rect_filled(rect, 6.0, Color32::from_rgb(226, 223, 218));
+                            }
+                            let mut text = label.to_string();
+                            if text.chars().count() > 22 {
+                                text = text.chars().take(21).collect::<String>() + "…";
+                            }
+                            p.text(
+                                rect.left_center() + vec2(10.0, 0.0),
+                                Align2::LEFT_CENTER,
+                                text,
+                                FontId::proportional(14.5),
+                                Color32::from_rgb(30, 30, 30),
+                            );
+                            p.text(
+                                rect.right_center() - vec2(10.0, 0.0),
+                                Align2::RIGHT_CENTER,
+                                n.to_string(),
+                                FontId::proportional(12.5),
+                                Color32::from_gray(120),
+                            );
+                            let r = r.on_hover_text(label);
+                            if r.clicked() {
+                                new_filter = Some(f);
+                            }
+                            r
+                        };
+                        let head = |ui: &mut egui::Ui, t: &str| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(t)
+                                    .strong()
+                                    .size(13.0)
+                                    .color(Color32::from_gray(90)),
+                            );
+                        };
+                        head(ui, "Biblioteca");
+                        row(ui, Filter::Leyendo, "Leyendo", counts[0]);
+                        row(ui, Filter::ParaLeer, "Para leer", counts[1]);
+                        row(ui, Filter::Terminados, "Terminados", counts[2]);
+                        row(ui, Filter::Todo, "Todo", n_total);
+                        row(ui, Filter::Libros, "Libros", counts[3]);
+                        row(ui, Filter::Pdf, "PDF", counts[4]);
+                        head(ui, "Explorar");
+                        row(ui, Filter::Autores, "Autores", auth_sorted.len());
+                        row(ui, Filter::Temas, "Temas", subj_sorted.len());
+                        if !subj_sorted.is_empty() {
+                            head(ui, "Temas principales");
+                            for (t, n) in subj_sorted.iter().take(10) {
+                                row(ui, Filter::Tema(t.clone()), t, *n);
+                            }
+                        }
+                        head(ui, "Mis colecciones");
+                        for (c, n) in collections.iter().zip(&coll_counts) {
+                            let r = row(ui, Filter::Coleccion(c.clone()), c, *n);
+                            r.context_menu(|ui| {
+                                if ui.button("Eliminar colección").clicked() {
+                                    delete_collection = Some(c.clone());
+                                    ui.close();
+                                }
+                            });
+                        }
+                        match &mut self.new_collection {
+                            Some(name) => {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .hint_text("Nombre y pulsa Intro"),
+                                );
+                                r.request_focus();
+                                if r.lost_focus() {
+                                    let n = name.trim().to_string();
+                                    if !n.is_empty() && !self.saved.collections.contains(&n) {
+                                        self.saved.collections.push(n.clone());
+                                        new_filter = Some(Filter::Coleccion(n));
+                                    }
+                                    self.new_collection = None;
+                                }
+                            }
+                            None => {
+                                if ui.button("+ Nueva colección").clicked() {
+                                    self.new_collection = Some(String::new());
+                                }
+                            }
+                        }
+                    });
+            });
+        if let Some(f) = new_filter {
+            self.filter = f;
+        }
+        if let Some(c) = delete_collection {
+            self.saved.collections.retain(|x| *x != c);
+            for e in &mut self.saved.library {
+                e.collections.retain(|x| *x != c);
+            }
+            if self.filter == Filter::Coleccion(c) {
+                self.filter = Filter::Todo;
+            }
+        }
+
+        // ---- lista filtrada
+        let q = self.search.to_lowercase();
+        let lib = &self.saved.library;
+        let mut order: Vec<usize> = (0..lib.len())
+            .filter(|&i| {
+                let e = &lib[i];
+                self.filter.matches(e)
+                    && (q.is_empty()
+                        || e.title.to_lowercase().contains(&q)
+                        || e.author.to_lowercase().contains(&q)
+                        || e.subjects.iter().any(|s| s.to_lowercase().contains(&q)))
+            })
+            .collect();
+        let sort = self.saved.sort;
+        order.sort_by(|&a, &b| {
+            let (ea, eb) = (&lib[a], &lib[b]);
+            match sort {
+                1 => sort_key(&ea.title).cmp(&sort_key(&eb.title)),
+                2 => sort_key(ea.author_name())
+                    .cmp(&sort_key(eb.author_name()))
+                    .then(sort_key(&ea.title).cmp(&sort_key(&eb.title))),
+                3 => eb
+                    .progress
+                    .partial_cmp(&ea.progress)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                _ => eb
+                    .last_opened
+                    .cmp(&ea.last_opened)
+                    .then(eb.added.cmp(&ea.added)),
+            }
+        });
+        let n_pdf_shown = order.iter().filter(|&&i| lib[i].is_pdf).count();
+        let list_mode = matches!(self.filter, Filter::Autores | Filter::Temas);
+
+        egui::Panel::top("cabecera")
+            .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin {
+                left: 28,
+                right: 28,
+                top: 18,
+                bottom: 10,
+            }))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    if matches!(self.filter, Filter::Autor(_)) && ui.button("‹ Autores").clicked()
+                    {
+                        self.filter = Filter::Autores;
+                    }
+                    if matches!(self.filter, Filter::Tema(_)) && ui.button("‹ Temas").clicked() {
+                        self.filter = Filter::Temas;
+                    }
                     ui.label(
-                        egui::RichText::new("Biblioteca")
+                        egui::RichText::new(self.filter.title())
                             .font(FontId::new(34.0, FontFamily::Name("serif-b".into())))
-                            .color(Color32::from_rgb(30, 30, 30)),
+                            .color(ink),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -500,30 +811,34 @@ impl App {
                         if ui.button("Abrir…").clicked() {
                             do_open = true;
                         }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .hint_text("Buscar título o autor")
-                                .desired_width(200.0),
-                        );
+                        if !list_mode {
+                            ui.add_space(12.0);
+                            let names = ["Recientes", "Título", "Autor", "Progreso"];
+                            egui::ComboBox::from_id_salt("orden")
+                                .selected_text(names[sort as usize % 4])
+                                .show_ui(ui, |ui| {
+                                    for (k, n) in names.iter().enumerate() {
+                                        ui.selectable_value(&mut self.saved.sort, k as u8, *n);
+                                    }
+                                });
+                            ui.label(egui::RichText::new("Ordenar").color(Color32::GRAY));
+                        }
                     });
                 });
-                let n_pdf = self.saved.library.iter().filter(|e| e.is_pdf).count();
-                ui.label(
-                    egui::RichText::new(format!(
+                let sub = match self.filter {
+                    Filter::Autores => format!("{} autores", auth_sorted.len()),
+                    Filter::Temas => format!("{} temas", subj_sorted.len()),
+                    _ => format!(
                         "{} libros, {} archivos PDF",
-                        self.saved.library.len() - n_pdf,
-                        n_pdf
-                    ))
-                    .color(Color32::GRAY),
-                );
+                        order.len() - n_pdf_shown,
+                        n_pdf_shown
+                    ),
+                };
+                ui.label(egui::RichText::new(sub).color(Color32::GRAY));
             });
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(250, 249, 247))
-                    .inner_margin(egui::Margin::symmetric(28, 8)),
-            )
+            .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin::symmetric(28, 8)))
             .show(ui, |ui| {
                 if self.saved.library.is_empty() {
                     ui.add_space(80.0);
@@ -535,97 +850,171 @@ impl App {
                         );
                         ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new(
-                                "o usa «Abrir…», «Añadir carpeta…» o «Importar Apple Books»",
-                            )
-                            .color(Color32::GRAY),
+                            egui::RichText::new("o usa «Abrir…», «Añadir carpeta…» o «Importar Apple Books»")
+                                .color(Color32::GRAY),
                         );
                     });
                     return;
                 }
-                let q = self.search.to_lowercase();
-                let mut order: Vec<usize> = (0..self.saved.library.len())
-                    .filter(|&i| {
-                        let e = &self.saved.library[i];
-                        q.is_empty()
-                            || e.title.to_lowercase().contains(&q)
-                            || e.author.to_lowercase().contains(&q)
-                    })
-                    .collect();
-                order.sort_by(|&a, &b| {
-                    let (ea, eb) = (&self.saved.library[a], &self.saved.library[b]);
-                    eb.last_opened
-                        .cmp(&ea.last_opened)
-                        .then(eb.added.cmp(&ea.added))
-                });
-
+                // ---- vista de autores / temas
+                if list_mode {
+                    let is_auth = self.filter == Filter::Autores;
+                    let mut items: Vec<(String, usize)> =
+                        if is_auth { auth_sorted.clone() } else { subj_sorted.clone() };
+                    items.sort_by(|a, b| sort_key(&a.0).cmp(&sort_key(&b.0)));
+                    items.retain(|(n, _)| q.is_empty() || n.to_lowercase().contains(&q));
+                    if items.is_empty() {
+                        ui.add_space(40.0);
+                        ui.label(
+                            egui::RichText::new(if is_auth {
+                                "Sin resultados."
+                            } else {
+                                "Los temas se leen de los propios EPUB (todavía cargando o el libro no los trae)."
+                            })
+                            .color(Color32::GRAY),
+                        );
+                    }
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        let mut letter = String::new();
+                        for (name, n) in items {
+                            let l: String = sort_key(&name)
+                                .chars()
+                                .next()
+                                .map(|c| c.to_uppercase().collect())
+                                .unwrap_or_default();
+                            if l != letter {
+                                letter = l.clone();
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(&l)
+                                        .font(FontId::new(22.0, FontFamily::Name("serif-b".into())))
+                                        .color(Color32::from_rgb(130, 30, 30)),
+                                );
+                                ui.separator();
+                            }
+                            let r = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "{name}   ·   {n} {}",
+                                        if n == 1 { "libro" } else { "libros" }
+                                    ))
+                                    .size(16.0)
+                                    .color(ink),
+                                )
+                                .frame_when_inactive(false),
+                            );
+                            if r.clicked() {
+                                self.filter = if is_auth { Filter::Autor(name.clone()) } else { Filter::Tema(name.clone()) };
+                                self.search.clear();
+                            }
+                        }
+                    });
+                    return;
+                }
+                if order.is_empty() {
+                    ui.add_space(40.0);
+                    ui.label(egui::RichText::new("No hay libros aquí.").color(Color32::GRAY));
+                    return;
+                }
                 let cell = vec2(170.0, 300.0);
-                let cols = ((ui.available_width() + 24.0) / (cell.x + 24.0))
-                    .floor()
-                    .max(1.0) as usize;
+                let cols = ((ui.available_width() + 24.0) / (cell.x + 24.0)).floor().max(1.0) as usize;
                 let rows = order.len().div_ceil(cols);
-                egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-                    ui,
-                    cell.y,
-                    rows,
-                    |ui, range| {
-                        for r in range {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 24.0;
-                                for c in 0..cols {
-                                    let Some(&i) = order.get(r * cols + c) else {
-                                        break;
-                                    };
-                                    let (resp, want_cover) = self.book_cell(ui, i, cell);
-                                    if want_cover {
-                                        create_idx = Some(i);
-                                    } else if resp.clicked() {
+                let colls = collections.clone();
+                egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, cell.y, rows, |ui, range| {
+                    for r in range {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 24.0;
+                            for c in 0..cols {
+                                let Some(&i) = order.get(r * cols + c) else { break };
+                                let (resp, want_cover) = self.book_cell(ui, i, cell);
+                                if want_cover {
+                                    create_idx = Some(i);
+                                } else if resp.clicked() {
+                                    open_idx = Some(i);
+                                }
+                                let has_cover =
+                                    matches!(self.cover_tex.get(&self.saved.library[i].path), Some(Some(_)));
+                                resp.context_menu(|ui| {
+                                    if ui.button("Abrir").clicked() {
                                         open_idx = Some(i);
                                     }
-                                    let has_cover = matches!(
-                                        self.cover_tex.get(&self.saved.library[i].path),
-                                        Some(Some(_))
-                                    );
-                                    resp.context_menu(|ui| {
-                                        if ui.button("Abrir").clicked() {
-                                            open_idx = Some(i);
+                                    let fin = self.saved.library[i].is_finished();
+                                    if ui
+                                        .button(if fin { "Marcar como no terminado" } else { "Marcar como terminado" })
+                                        .clicked()
+                                    {
+                                        let e = &mut self.saved.library[i];
+                                        if fin {
+                                            e.finished = false;
+                                            if e.progress >= 0.995 {
+                                                e.progress = 0.99;
+                                            }
+                                        } else {
+                                            e.finished = true;
                                         }
-                                        #[cfg(target_os = "macos")]
-                                        if ui.button("Mostrar en Finder").clicked() {
-                                            let _ = std::process::Command::new("open")
-                                                .arg("-R")
-                                                .arg(&self.saved.library[i].path)
-                                                .spawn();
+                                        ui.close();
+                                    }
+                                    ui.menu_button("Añadir a colección", |ui| {
+                                        for c in &colls {
+                                            let mut on = self.saved.library[i].collections.contains(c);
+                                            if ui.checkbox(&mut on, c).changed() {
+                                                let e = &mut self.saved.library[i];
+                                                if on {
+                                                    e.collections.push(c.clone());
+                                                } else {
+                                                    e.collections.retain(|x| x != c);
+                                                }
+                                            }
                                         }
-                                        if ui
-                                            .button(if self.saved.library[i].is_pdf {
-                                                "Añadir portada…"
-                                            } else if has_cover {
-                                                "Cambiar portada…"
-                                            } else {
-                                                "Crear portada…"
-                                            })
-                                            .clicked()
-                                        {
-                                            create_idx = Some(i);
-                                            ui.close();
-                                        }
-                                        if ui.button("Volver a buscar la portada").clicked() {
-                                            let path = self.saved.library[i].path.clone();
-                                            self.requested.remove(&path);
-                                            self.cover_tex.remove(&path);
-                                            ui.close();
-                                        }
-                                        if ui.button("Quitar de la biblioteca").clicked() {
-                                            remove_idx = Some(i);
+                                        if colls.is_empty() {
+                                            ui.weak("Crea una con «+ Nueva colección»");
                                         }
                                     });
-                                }
-                            });
-                        }
-                    },
-                );
+                                    ui.separator();
+                                    #[cfg(target_os = "macos")]
+                                    if ui.button("Mostrar en Finder").clicked() {
+                                        let _ = std::process::Command::new("open")
+                                            .arg("-R")
+                                            .arg(&self.saved.library[i].path)
+                                            .spawn();
+                                    }
+                                    let label = if self.saved.library[i].is_pdf {
+                                        "Añadir portada…"
+                                    } else if has_cover {
+                                        "Cambiar portada…"
+                                    } else {
+                                        "Crear portada…"
+                                    };
+                                    if ui.button(label).clicked() {
+                                        create_idx = Some(i);
+                                        ui.close();
+                                    }
+                                    if ui.button("Volver a buscar la portada").clicked() {
+                                        let path = self.saved.library[i].path.clone();
+                                        self.requested.remove(&path);
+                                        self.cover_tex.remove(&path);
+                                        ui.close();
+                                    }
+                                    if ui.button("Quitar de la biblioteca").clicked() {
+                                        remove_idx = Some(i);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
             });
+
+        // metadatos (temas, autores) de todos los libros, en segundo plano
+        for e in &self.saved.library {
+            if (e.meta_v < 2)
+                && !self.requested.contains(&e.path)
+                && !self.meta_requested.contains(&e.path)
+            {
+                self.meta_requested.insert(e.path.clone());
+                self.covers.request_meta(&e.path);
+            }
+        }
 
         if do_open {
             self.open_dialog(&ctx);
@@ -689,7 +1078,7 @@ impl App {
         let e = &self.saved.library[i];
         if !self.requested.contains(&e.path) {
             self.requested.insert(e.path.clone());
-            self.covers.request(&e.path, !e.meta_done);
+            self.covers.request(&e.path, !e.meta_done || e.meta_v < 2);
         }
         let p = ui.painter();
         let cover_area = Rect::from_min_size(rect.min, vec2(cell.x, 240.0));
@@ -2341,6 +2730,30 @@ impl App {
             self.cover_editor = None;
         }
     }
+}
+
+/// Clave de orden: sin acentos ni artículos, en minúsculas.
+fn sort_key(s: &str) -> String {
+    let t: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'é' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'ú' | 'ù' | 'ü' | 'û' => 'u',
+            '¿' | '¡' | '"' | '“' | '«' => ' ',
+            c => c,
+        })
+        .collect();
+    let t = t.trim_start();
+    for art in ["el ", "la ", "los ", "las ", "the ", "un ", "una "] {
+        if let Some(r) = t.strip_prefix(art) {
+            return r.trim_start().to_string();
+        }
+    }
+    t.to_string()
 }
 
 fn l_page(ep: &EpubState, b: (usize, usize)) -> Option<usize> {

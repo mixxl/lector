@@ -156,7 +156,36 @@ impl Epub {
 }
 
 /// Lectura rápida de metadatos y portada (para la biblioteca).
-pub fn quick_info(path: &Path) -> Option<(String, String, Option<Vec<u8>>)> {
+pub struct Info {
+    pub title: String,
+    pub author: String,
+    pub subjects: Vec<String>,
+}
+
+/// Normaliza un tema (dc:subject): descarta códigos BISAC/Thema y basura.
+fn clean_subject(s: &str) -> Option<String> {
+    let t = s
+        .trim()
+        .trim_matches(|c: char| c == '.' || c == '-' || c == '"');
+    if t.chars().count() < 3 || t.chars().count() > 40 {
+        return None;
+    }
+    let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits * 2 > t.len() || (t.len() <= 12 && digits >= 3) {
+        return None;
+    }
+    let mut c = t.chars();
+    let first = c.next()?;
+    let rest: String = c.collect();
+    let rest = if rest.chars().all(|c| !c.is_lowercase()) {
+        rest.to_lowercase()
+    } else {
+        rest
+    };
+    Some(first.to_uppercase().collect::<String>() + &rest)
+}
+
+pub fn quick_info(path: &Path) -> Option<(Info, Option<Vec<u8>>)> {
     let mut ar = Archive::open(path).ok()?;
     let opf_path = find_opf(&mut ar)?;
     let opf = ar.read_string(&opf_path)?;
@@ -186,7 +215,14 @@ pub fn quick_info(path: &Path) -> Option<(String, String, Option<Vec<u8>>)> {
             }
         }
     }
-    Some((pkg.title, pkg.author, cover))
+    Some((
+        Info {
+            title: pkg.title,
+            author: pkg.author,
+            subjects: pkg.subjects,
+        },
+        cover,
+    ))
 }
 
 fn find_opf(ar: &mut Archive) -> Option<String> {
@@ -254,6 +290,7 @@ struct Package {
     title: String,
     author: String,
     spine: Vec<String>,
+    subjects: Vec<String>,
     cover: Option<String>,
     cover_pages: Vec<String>,
     nav: Option<String>,
@@ -273,6 +310,7 @@ fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
     let base = dir_of(opf_path);
     let mut title = String::new();
     let mut author = String::new();
+    let mut subjects: Vec<String> = Vec::new();
     let mut cover_id = None;
     let mut manifest: HashMap<String, (String, String, String)> = HashMap::new();
     let mut spine_ids = Vec::new();
@@ -281,6 +319,15 @@ fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
         match n.tag_name().name() {
             "title" if title.is_empty() => title = n.text().unwrap_or("").trim().to_string(),
             "creator" if author.is_empty() => author = n.text().unwrap_or("").trim().to_string(),
+            "subject" => {
+                for part in n.text().unwrap_or("").split([',', ';', '/', '|']) {
+                    if let Some(t) = clean_subject(part) {
+                        if !subjects.contains(&t) {
+                            subjects.push(t);
+                        }
+                    }
+                }
+            }
             "meta" if n.attribute("name") == Some("cover") => {
                 cover_id = n.attribute("content").map(|s| s.to_string())
             }
@@ -369,6 +416,7 @@ fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
     Some(Package {
         title,
         author,
+        subjects,
         spine,
         cover,
         cover_pages,

@@ -8,6 +8,7 @@ Lector de **PDF y EPUB** escrito en **Rust puro**, pensado para que leer en pant
 - **PDF nítido**: se renderiza con [hayro](https://github.com/LaurenzV/hayro), un rasterizador de PDF en Rust puro, a la resolución exacta de la pantalla (Retina incluido). Zoom con pellizco, doble clic o ⌘+/⌘−.
 - **Revistas**: con «Portada sola», la portada va sola a la derecha y el resto en pliegos, como en papel.
 - **Temas**: Día, Sepia, Gris y Noche (en Noche, los PDF se invierten conservando los tonos).
+- **Menú lateral** como Apple Books: Leyendo, Para leer, Terminados, Todo, Libros, PDF; **Autores** (índice alfabético) y **Temas** (leídos de los propios EPUB); **Mis colecciones** propias; buscador por título, autor o tema y orden por recientes, título, autor o progreso.
 - **Biblioteca** con portadas al estilo de Apple Books, búsqueda, progreso y recuerdo de la última página. Puede **importar los libros de Apple Books**.
 - **Portadas**: detecta la portada aunque el EPUB la declare de forma poco estándar. Si un libro no tiene, puedes **crearla** (diseño tipográfico con 6 estilos o una imagen tuya) y **añadirla al propio archivo**: dentro del EPUB o como primera página del PDF. Se guarda antes una copia del original en `~/Library/Application Support/Lector/copias`.
 - Botón **«Ver una página / Ver dos páginas»** en la barra del lector.
