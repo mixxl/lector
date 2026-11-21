@@ -1,0 +1,33 @@
+[package]
+name = "lector"
+version = "0.1.0"
+edition = "2024"
+description = "Lector de PDF y EPUB en Rust puro con aspecto de libro real"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "persistence", "accesskit", "x11", "wayland"] }
+hayro = "0.9.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rfd = "0.18.0"
+roxmltree = "0.21.2"
+serde = { version = "1.0.229", features = ["derive"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
+dirs = "7.0.0"
+
+[features]
+default = ["wgpu"]
+# Metal en macOS (recomendado)
+wgpu = ["eframe/wgpu"]
+# OpenGL (alternativa)
+glow = ["eframe/glow"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# hayro rasteriza en CPU: optimizarlo también en debug
+[profile.dev.package."*"]
+opt-level = 3
