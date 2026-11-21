@@ -5,6 +5,7 @@ mod book;
 mod cover;
 mod covers;
 mod epub;
+mod genres;
 mod layout;
 #[cfg(target_os = "macos")]
 mod macos;

@@ -85,6 +85,10 @@ pub struct Entry {
     pub meta_v: u8,
     pub notes: Vec<Note>,
     pub finished_at: u64,
+    /// datos corregidos a mano: no se sobrescriben
+    pub edited: bool,
+    /// ya se buscaron temas en Open Library
+    pub online_done: bool,
 }
 
 /// Subrayado con nota opcional. En PDF: nota de página (chapter = página).
@@ -182,7 +186,9 @@ impl Filter {
             Filter::Terminados => e.is_finished(),
             Filter::Libros => !e.is_pdf,
             Filter::Pdf => e.is_pdf,
-            Filter::Autor(a) => e.author_name() == a,
+            Filter::Autor(a) => {
+                crate::genres::author_key(e.author_name()) == crate::genres::author_key(a)
+            }
             Filter::Tema(t) => e.subjects.iter().any(|s| s == t),
             Filter::Coleccion(c) => e.collections.iter().any(|s| s == c),
         }
@@ -325,6 +331,9 @@ pub struct App {
     stat_tick: Option<std::time::Instant>,
     stat_acc: f32,
     meta_editor: Option<(usize, String, String, String)>,
+    online_tx: std::sync::mpsc::Sender<(String, String, String)>,
+    online_rx: std::sync::mpsc::Receiver<(String, Vec<String>)>,
+    online_requested: HashSet<String>,
 }
 
 impl Drop for Reader {
@@ -367,10 +376,31 @@ impl CoverEditor {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Vec<String>) -> Self {
-        let saved: Saved = cc
+        let mut saved: Saved = cc
             .storage
             .and_then(|s| eframe::get_value(s, "estado"))
             .unwrap_or_default();
+        // autores y temas coherentes ("Huxley, Aldous" = "Aldous Huxley")
+        for e in &mut saved.library {
+            e.author = crate::genres::normalize_author(&e.author);
+            e.subjects = crate::genres::normalize_subjects(&e.subjects);
+        }
+        // hilo de búsqueda de temas en Open Library
+        let (online_tx, req) = std::sync::mpsc::channel::<(String, String, String)>();
+        let (res, online_rx) = std::sync::mpsc::channel::<(String, Vec<String>)>();
+        {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                while let Ok((path, title, author)) = req.recv() {
+                    let subs = crate::genres::lookup_online(&title, &author);
+                    if res.send((path, subs)).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            });
+        }
         cc.egui_ctx.set_theme(egui::Theme::Light);
         cc.egui_ctx
             .all_styles_mut(|s| s.spacing.button_padding = vec2(10.0, 5.0));
@@ -391,6 +421,9 @@ impl App {
             stat_tick: None,
             stat_acc: 0.0,
             meta_editor: None,
+            online_tx,
+            online_rx,
+            online_requested: HashSet::new(),
         }
     }
 
@@ -672,14 +705,21 @@ impl eframe::App for App {
         while let Ok(r) = self.covers.rx.try_recv() {
             if let Some(e) = self.saved.library.iter_mut().find(|e| e.path == r.path) {
                 if let Some(info) = r.meta {
-                    if !info.title.is_empty() && (!e.meta_done || e.meta_v < 2) {
-                        e.title = info.title;
+                    if !e.edited {
+                        if !info.title.is_empty() && (!e.meta_done || e.meta_v < 3) {
+                            e.title = info.title;
+                        }
+                        if !info.author.is_empty() {
+                            e.author = crate::genres::normalize_author(&info.author);
+                        }
+                        let subs = crate::genres::normalize_subjects(&info.subjects);
+                        if !subs.is_empty() || e.subjects.is_empty() || !e.online_done {
+                            if !subs.is_empty() {
+                                e.subjects = subs;
+                            }
+                        }
                     }
-                    if !info.author.is_empty() {
-                        e.author = info.author;
-                    }
-                    e.subjects = info.subjects;
-                    e.meta_v = 2;
+                    e.meta_v = 3;
                 }
                 e.meta_done = true;
             }
@@ -745,15 +785,24 @@ impl App {
         let count = |f: &Filter| lib.iter().filter(|e| f.matches(e)).count();
         let mut subjects: HashMap<String, usize> = HashMap::new();
         let mut authors: HashMap<String, usize> = HashMap::new();
+        let mut author_names: HashMap<String, String> = HashMap::new();
         for e in lib {
             for t in &e.subjects {
                 *subjects.entry(t.clone()).or_default() += 1;
             }
-            *authors.entry(e.author_name().to_string()).or_default() += 1;
+            let k = crate::genres::author_key(e.author_name());
+            let slot = author_names
+                .entry(k.clone())
+                .or_insert_with(|| e.author_name().to_string());
+            let _ = slot;
+            *authors.entry(k).or_default() += 1;
         }
         let mut subj_sorted: Vec<(String, usize)> = subjects.into_iter().collect();
         subj_sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let mut auth_sorted: Vec<(String, usize)> = authors.into_iter().collect();
+        let mut auth_sorted: Vec<(String, usize)> = authors
+            .into_iter()
+            .map(|(k, n)| (author_names.get(&k).cloned().unwrap_or(k), n))
+            .collect();
         auth_sorted.sort_by(|a, b| sort_key(&a.0).cmp(&sort_key(&b.0)));
         let mut collections = self.saved.collections.clone();
         for e in lib {
@@ -1247,9 +1296,31 @@ impl App {
                 });
             });
 
+        // temas que faltan: búsqueda en Open Library (uno a uno, en segundo plano)
+        for e in &self.saved.library {
+            if e.meta_v >= 3
+                && e.subjects.is_empty()
+                && !e.online_done
+                && !e.edited
+                && !self.online_requested.contains(&e.path)
+            {
+                self.online_requested.insert(e.path.clone());
+                let _ = self
+                    .online_tx
+                    .send((e.path.clone(), e.title.clone(), e.author.clone()));
+            }
+        }
+        while let Ok((path, subs)) = self.online_rx.try_recv() {
+            if let Some(e) = self.saved.library.iter_mut().find(|e| e.path == path) {
+                if !e.edited && e.subjects.is_empty() {
+                    e.subjects = subs;
+                }
+                e.online_done = true;
+            }
+        }
         // metadatos (temas, autores) de todos los libros, en segundo plano
         for e in &self.saved.library {
-            if (e.meta_v < 2)
+            if (e.meta_v < 3)
                 && !self.requested.contains(&e.path)
                 && !self.meta_requested.contains(&e.path)
             {
@@ -1320,7 +1391,7 @@ impl App {
         let e = &self.saved.library[i];
         if !self.requested.contains(&e.path) {
             self.requested.insert(e.path.clone());
-            self.covers.request(&e.path, !e.meta_done || e.meta_v < 2);
+            self.covers.request(&e.path, !e.meta_done || e.meta_v < 3);
         }
         let p = ui.painter();
         let cover_area = Rect::from_min_size(rect.min, vec2(cell.x, 240.0));
@@ -3869,8 +3940,10 @@ impl App {
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty())
                     .collect();
-                e.meta_v = 2;
+                e.meta_v = 3;
                 e.meta_done = true;
+                e.edited = true;
+                e.online_done = true;
             }
             close = true;
         }

@@ -368,6 +368,7 @@ fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
     let mut author = String::new();
     let mut subjects: Vec<String> = Vec::new();
     let mut language = String::new();
+    let mut author_is_fallback = false;
     let mut cover_id = None;
     let mut manifest: HashMap<String, (String, String, String)> = HashMap::new();
     let mut spine_ids = Vec::new();
@@ -378,7 +379,22 @@ fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
             "language" if language.is_empty() => {
                 language = n.text().unwrap_or("").trim().to_string()
             }
-            "creator" if author.is_empty() => author = n.text().unwrap_or("").trim().to_string(),
+            "creator" => {
+                // el primer creador que sea autor (no traductor, ilustrador…)
+                let role = n
+                    .attributes()
+                    .find(|a| a.name() == "role")
+                    .map(|a| a.value().to_lowercase())
+                    .unwrap_or_default();
+                let t = n.text().unwrap_or("").trim().to_string();
+                if !t.is_empty() && (role.is_empty() || role == "aut") && (author.is_empty() || author_is_fallback) {
+                    author = t;
+                    author_is_fallback = false;
+                } else if author.is_empty() && !t.is_empty() {
+                    author = t;
+                    author_is_fallback = true;
+                }
+            }
             "subject" => {
                 for part in n.text().unwrap_or("").split([',', ';', '/', '|']) {
                     if let Some(t) = clean_subject(part) {
