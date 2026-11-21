@@ -1008,6 +1008,7 @@ impl App {
                 bottom: 10,
             }))
             .show(ui, |ui| {
+                // fila 1: título (se recorta si no cabe, nunca se monta sobre los botones)
                 ui.horizontal(|ui| {
                     if matches!(self.filter, Filter::Autor(_)) && ui.button("‹ Autores").clicked()
                     {
@@ -1016,38 +1017,14 @@ impl App {
                     if matches!(self.filter, Filter::Tema(_)) && ui.button("‹ Temas").clicked() {
                         self.filter = Filter::Temas;
                     }
-                    ui.label(
-                        egui::RichText::new(self.filter.title())
-                            .font(FontId::new(34.0, FontFamily::Name("serif-b".into())))
-                            .color(ink),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(self.filter.title())
+                                .font(FontId::new(34.0, FontFamily::Name("serif-b".into())))
+                                .color(ink),
+                        )
+                        .truncate(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("Importar Apple Books")
-                            .on_hover_text("Añade los libros que tengas en la app Libros de macOS")
-                            .clicked()
-                        {
-                            do_apple = true;
-                        }
-                        if ui.button("Añadir carpeta…").clicked() {
-                            do_folder = true;
-                        }
-                        if ui.button("Abrir…").clicked() {
-                            do_open = true;
-                        }
-                        if !list_mode {
-                            ui.add_space(12.0);
-                            let names = ["Recientes", "Título", "Autor", "Progreso"];
-                            egui::ComboBox::from_id_salt("orden")
-                                .selected_text(names[sort as usize % 4])
-                                .show_ui(ui, |ui| {
-                                    for (k, n) in names.iter().enumerate() {
-                                        ui.selectable_value(&mut self.saved.sort, k as u8, *n);
-                                    }
-                                });
-                            ui.label(egui::RichText::new("Ordenar").color(Color32::GRAY));
-                        }
-                    });
                 });
                 let sub = match self.filter {
                     Filter::Autores => format!("{} autores", auth_sorted.len()),
@@ -1059,7 +1036,37 @@ impl App {
                         n_pdf_shown
                     ),
                 };
-                ui.label(egui::RichText::new(sub).color(Color32::GRAY));
+                ui.add_space(4.0);
+                // fila 2: recuento y controles; si no caben, pasan a otra línea
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(sub).color(Color32::GRAY));
+                    ui.add_space(16.0);
+                    if !list_mode {
+                        ui.label(egui::RichText::new("Ordenar").color(Color32::GRAY));
+                        let names = ["Recientes", "Título", "Autor", "Progreso"];
+                        egui::ComboBox::from_id_salt("orden")
+                            .selected_text(names[sort as usize % 4])
+                            .show_ui(ui, |ui| {
+                                for (k, n) in names.iter().enumerate() {
+                                    ui.selectable_value(&mut self.saved.sort, k as u8, *n);
+                                }
+                            });
+                        ui.add_space(12.0);
+                    }
+                    if ui.button("Abrir…").clicked() {
+                        do_open = true;
+                    }
+                    if ui.button("Añadir carpeta…").clicked() {
+                        do_folder = true;
+                    }
+                    if ui
+                        .button("Importar Apple Books")
+                        .on_hover_text("Añade los libros que tengas en la app Libros de macOS")
+                        .clicked()
+                    {
+                        do_apple = true;
+                    }
+                });
             });
 
         egui::CentralPanel::default()
@@ -1375,11 +1382,29 @@ impl App {
         if title.chars().count() > 26 {
             title = title.chars().take(24).collect::<String>() + "…";
         }
-        p.text(
+        // el título nunca invade la celda vecina
+        let font = FontId::proportional(13.5);
+        while title.chars().count() > 3
+            && ui.fonts_mut(|f| {
+                f.layout_no_wrap(title.clone(), font.clone(), Color32::BLACK)
+                    .size()
+                    .x
+            }) > cell.x
+        {
+            let n = title.chars().count();
+            title = title
+                .chars()
+                .take(n.saturating_sub(2))
+                .collect::<String>()
+                .trim_end_matches('…')
+                .to_string()
+                + "…";
+        }
+        ui.painter_at(rect).text(
             pos2(rect.left(), cover_area.bottom() + 10.0),
             Align2::LEFT_TOP,
             title,
-            FontId::proportional(13.5),
+            font,
             Color32::from_rgb(30, 30, 30),
         );
         let sub = if !e.opened {
@@ -2949,6 +2974,9 @@ impl App {
         let mut open_settings = reader.show_settings;
         let mut open_toc = reader.show_toc;
         if alpha > 0.01 {
+            // barra más compacta en ventanas estrechas para que nada se solape
+            let compact = full.width() < 1100.0;
+            let very_compact = full.width() < 820.0;
             egui::Area::new(egui::Id::NULL.with("barra_sup"))
                 .fixed_pos(full.left_top())
                 .order(egui::Order::Foreground)
@@ -2964,7 +2992,17 @@ impl App {
                                 if ui.button("‹ Biblioteca").clicked() {
                                     back_to_library = true;
                                 }
-                                if ui.selectable_label(open_toc, "Índice y notas").clicked() {
+                                if ui
+                                    .selectable_label(
+                                        open_toc,
+                                        if compact {
+                                            "Índice"
+                                        } else {
+                                            "Índice y notas"
+                                        },
+                                    )
+                                    .clicked()
+                                {
                                     open_toc = !open_toc;
                                 }
                                 ui.with_layout(
@@ -2972,10 +3010,11 @@ impl App {
                                     |ui| {
                                         let fs = input.viewport().fullscreen.unwrap_or(false);
                                         if ui
-                                            .button(if fs {
-                                                "Salir de pantalla completa"
-                                            } else {
-                                                "Pantalla completa"
+                                            .button(match (fs, compact) {
+                                                (true, true) => "Salir",
+                                                (true, false) => "Salir de pantalla completa",
+                                                (false, true) => "Completa",
+                                                (false, false) => "Pantalla completa",
                                             })
                                             .on_hover_text("Pantalla completa (F)")
                                             .clicked()
@@ -2985,7 +3024,12 @@ impl App {
                                             );
                                         }
                                         if ui
-                                            .button(if double { "1 página" } else { "2 páginas" })
+                                            .button(match (double, compact) {
+                                                (true, true) => "1 pág.",
+                                                (true, false) => "1 página",
+                                                (false, true) => "2 págs.",
+                                                (false, false) => "2 páginas",
+                                            })
                                             .on_hover_text(
                                                 "Cambiar entre lectura a una o dos páginas",
                                             )
@@ -3037,7 +3081,9 @@ impl App {
                                         {
                                             toggle_bookmark = true;
                                         }
-                                        if let Doc::Pdf(p) = &mut reader.doc {
+                                        if let (Doc::Pdf(p), false) =
+                                            (&mut reader.doc, very_compact)
+                                        {
                                             if ui.button("+").on_hover_text("Ampliar").clicked() {
                                                 p.zoom = (p.zoom * 1.25).min(6.0);
                                             }
