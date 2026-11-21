@@ -35,7 +35,7 @@ impl Default for Settings {
             theme: 0,
             font_size: 19.0,
             line_spacing: 1.42,
-            margin: 0.10,
+            margin: 0.07,
             sans: false,
             justify: true,
             page_mode: 0,
@@ -931,7 +931,7 @@ impl App {
         book::desk(&painter, full, &th);
 
         // ---- área útil y modo de página
-        let area = full.shrink2(vec2(24.0, 36.0));
+        let area = full.shrink2(vec2(14.0, 16.0));
         let double = match settings.page_mode {
             1 => false,
             2 => true,
@@ -940,23 +940,17 @@ impl App {
 
         // ---- EPUB: paginación
         let is_pdf = matches!(reader.doc, Doc::Pdf(_));
+        // EPUB: las páginas ocupan toda la pantalla disponible
         let epub_page = |area: Rect, double: bool| -> Vec2 {
-            let mut ph = area.height();
-            let mut pw = ph * 0.68;
-            let maxw = if double {
-                area.width() / 2.0
+            if double {
+                vec2(area.width() / 2.0, area.height())
             } else {
-                area.width()
-            };
-            if pw > maxw {
-                pw = maxw;
-                ph = (pw / 0.68).min(area.height());
+                vec2(area.width(), area.height())
             }
-            vec2(pw, ph)
         };
         let margins = |size: Vec2| -> (f32, f32, f32) {
             // (lateral, superior, inferior)
-            (size.x * settings.margin, size.y * 0.085, size.y * 0.095)
+            (size.x * settings.margin, size.y * 0.06, size.y * 0.07)
         };
         if let Doc::Epub(ep) = &mut reader.doc {
             let size = epub_page(area, double);
@@ -1114,23 +1108,26 @@ impl App {
                     push(r, page_h / zoom, pdf);
                 }
             }
-            let list: Vec<(usize, f32)> = want
+            // Páginas que faltan (o con resolución insuficiente). Se envía siempre
+            // la lista completa: el hilo de render sustituye su cola por la última
+            // petición, así ninguna página se queda "pendiente" para siempre.
+            let ok = |v: Option<f32>, s: f32| {
+                v.is_some_and(|v| (v / s - 1.0).abs() < 0.2 || (v > s && v / s < 1.6))
+            };
+            let missing: Vec<(usize, f32)> = want
                 .iter()
-                .filter(|(p, s)| {
-                    let have = pdf.tex.get(p).map(|t| t.1);
-                    let pend = pdf.pending.get(p).copied();
-                    let ok = |v: Option<f32>| {
-                        v.is_some_and(|v| (v / s - 1.0).abs() < 0.2 || (v > *s && v / s < 1.6))
-                    };
-                    !ok(have) && !ok(pend)
-                })
+                .filter(|(p, s)| !ok(pdf.tex.get(p).map(|t| t.1), *s))
                 .copied()
                 .collect();
-            if !list.is_empty() {
-                for (p, s) in &list {
-                    pdf.pending.insert(*p, *s);
+            let same = missing.len() == pdf.pending.len()
+                && missing
+                    .iter()
+                    .all(|(p, s)| ok(pdf.pending.get(p).copied(), *s));
+            if !same {
+                pdf.pending = missing.iter().copied().collect();
+                if !missing.is_empty() {
+                    pdf.worker.request(missing);
                 }
-                pdf.worker.request(list);
             }
             // liberar texturas lejanas
             let keep: HashSet<usize> = want.iter().map(|w| w.0).collect();
@@ -1262,15 +1259,6 @@ impl App {
                 }
                 if p.zoom <= 1.01 {
                     p.pan = Vec2::ZERO;
-                }
-            }
-            if resp.double_clicked() {
-                if p.zoom > 1.01 {
-                    p.zoom = 1.0;
-                    p.pan = Vec2::ZERO;
-                } else if let Some(ptr) = pointer {
-                    p.zoom = 2.2;
-                    p.pan = (area.center() - ptr) * 1.2;
                 }
             }
             if p.zoom > 1.01 {
@@ -2117,7 +2105,7 @@ impl App {
                                         .text("Interlineado"),
                                 );
                                 ui.add(
-                                    egui::Slider::new(&mut s.margin, 0.04..=0.18).text("Márgenes"),
+                                    egui::Slider::new(&mut s.margin, 0.02..=0.18).text("Márgenes"),
                                 );
                             }
                             ui.add_space(8.0);
