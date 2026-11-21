@@ -139,6 +139,37 @@ pub struct App {
     search: String,
     message: Option<(String, f64)>,
     initial: Vec<String>,
+    cover_editor: Option<CoverEditor>,
+}
+
+struct CoverEditor {
+    idx: usize,
+    title: String,
+    author: String,
+    style: usize,
+    custom: Option<image::DynamicImage>,
+    preview: Option<TextureHandle>,
+    dirty: bool,
+    replacing: bool,
+    /// tamaño de la página en puntos (PDF) o None (EPUB)
+    page: Option<(f32, f32)>,
+    error: Option<String>,
+}
+
+impl CoverEditor {
+    fn size(&self, w: u32) -> (u32, u32) {
+        match self.page {
+            Some((pw, ph)) => (w, ((w as f32) * ph / pw).round() as u32),
+            None => (w, w * 3 / 2),
+        }
+    }
+    fn render(&self, w: u32) -> image::RgbImage {
+        let (w, h) = self.size(w);
+        match &self.custom {
+            Some(img) => crate::cover::fit_image(img, w, h),
+            None => crate::cover::design(&self.title, &self.author, self.style, w, h),
+        }
+    }
 }
 
 impl App {
@@ -160,6 +191,7 @@ impl App {
             search: String::new(),
             message: None,
             initial,
+            cover_editor: None,
         }
     }
 
@@ -403,6 +435,7 @@ impl eframe::App for App {
             self.reader_ui(ui);
         } else {
             self.library_ui(ui);
+            self.cover_editor_ui(&ctx);
         }
 
         if let Some((msg, t0)) = &mut self.message {
@@ -435,6 +468,7 @@ impl App {
         }
         let mut open_idx = None;
         let mut remove_idx = None;
+        let mut create_idx = None;
         let mut do_open = false;
         let mut do_folder = false;
         let mut do_apple = false;
@@ -542,10 +576,16 @@ impl App {
                                     let Some(&i) = order.get(r * cols + c) else {
                                         break;
                                     };
-                                    let resp = self.book_cell(ui, i, cell);
-                                    if resp.clicked() {
+                                    let (resp, want_cover) = self.book_cell(ui, i, cell);
+                                    if want_cover {
+                                        create_idx = Some(i);
+                                    } else if resp.clicked() {
                                         open_idx = Some(i);
                                     }
+                                    let has_cover = matches!(
+                                        self.cover_tex.get(&self.saved.library[i].path),
+                                        Some(Some(_))
+                                    );
                                     resp.context_menu(|ui| {
                                         if ui.button("Abrir").clicked() {
                                             open_idx = Some(i);
@@ -556,6 +596,25 @@ impl App {
                                                 .arg("-R")
                                                 .arg(&self.saved.library[i].path)
                                                 .spawn();
+                                        }
+                                        if ui
+                                            .button(if self.saved.library[i].is_pdf {
+                                                "Añadir portada…"
+                                            } else if has_cover {
+                                                "Cambiar portada…"
+                                            } else {
+                                                "Crear portada…"
+                                            })
+                                            .clicked()
+                                        {
+                                            create_idx = Some(i);
+                                            ui.close();
+                                        }
+                                        if ui.button("Volver a buscar la portada").clicked() {
+                                            let path = self.saved.library[i].path.clone();
+                                            self.requested.remove(&path);
+                                            self.cover_tex.remove(&path);
+                                            ui.close();
                                         }
                                         if ui.button("Quitar de la biblioteca").clicked() {
                                             remove_idx = Some(i);
@@ -594,6 +653,26 @@ impl App {
                 self.add_many(v);
             }
         }
+        if let Some(i) = create_idx {
+            let e = &self.saved.library[i];
+            let page = if e.is_pdf {
+                Some(crate::pdfdoc::first_page_size(&e.path).unwrap_or((595.0, 842.0)))
+            } else {
+                None
+            };
+            self.cover_editor = Some(CoverEditor {
+                idx: i,
+                title: e.title.clone(),
+                author: e.author.clone(),
+                style: 0,
+                custom: None,
+                preview: None,
+                dirty: true,
+                replacing: matches!(self.cover_tex.get(&e.path), Some(Some(_))),
+                page,
+                error: None,
+            });
+        }
         if let Some(i) = remove_idx {
             self.saved.library.remove(i);
         } else if let Some(i) = open_idx {
@@ -601,11 +680,12 @@ impl App {
         }
     }
 
-    fn book_cell(&mut self, ui: &mut egui::Ui, i: usize, cell: Vec2) -> egui::Response {
+    fn book_cell(&mut self, ui: &mut egui::Ui, i: usize, cell: Vec2) -> (egui::Response, bool) {
         let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
         if !ui.is_rect_visible(rect) {
-            return resp;
+            return (resp, false);
         }
+        let mut want_cover = false;
         let e = &self.saved.library[i];
         if !self.requested.contains(&e.path) {
             self.requested.insert(e.path.clone());
@@ -717,7 +797,33 @@ impl App {
                 Color32::GRAY,
             );
         }
-        resp.on_hover_text(format!("{}\n{}", e.title, e.author))
+        // sin portada: botón para crearla
+        let no_cover = matches!(self.cover_tex.get(&e.path), Some(None));
+        if no_cover && resp.hovered() {
+            let b = Rect::from_center_size(
+                pos2(crect.center().x, crect.bottom() - 26.0),
+                vec2(124.0, 28.0),
+            );
+            p.rect_filled(b, 14.0, Color32::from_rgb(20, 90, 200));
+            p.text(
+                b.center(),
+                Align2::CENTER_CENTER,
+                "Crear portada",
+                FontId::proportional(13.0),
+                Color32::WHITE,
+            );
+            if resp.clicked()
+                && resp
+                    .interact_pointer_pos()
+                    .is_some_and(|q| b.expand(4.0).contains(q))
+            {
+                want_cover = true;
+            }
+        }
+        (
+            resp.on_hover_text(format!("{}\n{}", e.title, e.author)),
+            want_cover,
+        )
     }
 
     fn sync_entry(&mut self) {
@@ -1747,6 +1853,20 @@ impl App {
                                             );
                                         }
                                         if ui
+                                            .button(if double {
+                                                "Ver una página"
+                                            } else {
+                                                "Ver dos páginas"
+                                            })
+                                            .on_hover_text(
+                                                "Cambiar entre lectura a una o dos páginas",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.saved.settings.page_mode =
+                                                if double { 1 } else { 2 };
+                                        }
+                                        if ui
                                             .selectable_label(open_settings, "Aa")
                                             .on_hover_text("Apariencia")
                                             .clicked()
@@ -2057,6 +2177,180 @@ impl App {
         if back_to_library {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             self.reader = None;
+        }
+    }
+}
+
+impl App {
+    fn cover_editor_ui(&mut self, ctx: &egui::Context) {
+        let Some(ed) = self.cover_editor.as_mut() else {
+            return;
+        };
+        if ed.dirty {
+            let img = ed.render(360);
+            let ci = egui::ColorImage::from_rgb(
+                [img.width() as usize, img.height() as usize],
+                img.as_raw(),
+            );
+            ed.preview = Some(ctx.load_texture("portada-previa", ci, TextureOptions::LINEAR));
+            ed.dirty = false;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new(if ed.replacing {
+            "Cambiar portada"
+        } else {
+            "Crear portada"
+        })
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                if let Some(t) = &ed.preview {
+                    let s = t.size_vec2();
+                    let k = 380.0 / s.y;
+                    ui.add(egui::Image::new((t.id(), s * k)));
+                }
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.set_width(280.0);
+                    ui.label(egui::RichText::new("Diseño automático").strong());
+                    ui.label("Título");
+                    if ui.text_edit_singleline(&mut ed.title).changed() {
+                        ed.dirty = true;
+                    }
+                    ui.label("Autor");
+                    if ui.text_edit_singleline(&mut ed.author).changed() {
+                        ed.dirty = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.label("Estilo");
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, st) in crate::cover::STYLES.iter().enumerate() {
+                            let (r, resp) =
+                                ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
+                            let [br, bg, bb] = st.bg;
+                            let [ar, ag, ab] = st.accent;
+                            ui.painter()
+                                .rect_filled(r, 4.0, Color32::from_rgb(br, bg, bb));
+                            ui.painter().rect_stroke(
+                                r.shrink(5.0),
+                                2.0,
+                                egui::Stroke::new(2.0, Color32::from_rgb(ar, ag, ab)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if ed.style == i && ed.custom.is_none() {
+                                ui.painter().rect_stroke(
+                                    r.expand(2.0),
+                                    5.0,
+                                    egui::Stroke::new(2.5, Color32::from_rgb(20, 90, 200)),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            if resp.on_hover_text(st.name).clicked() {
+                                ed.style = i;
+                                ed.custom = None;
+                                ed.dirty = true;
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("O usa tu propia imagen").strong());
+                    ui.horizontal(|ui| {
+                        if ui.button("Elegir imagen…").clicked() {
+                            if let Some(f) = rfd::FileDialog::new()
+                                .add_filter("Imagen", &["jpg", "jpeg", "png", "webp", "gif"])
+                                .pick_file()
+                            {
+                                match image::open(&f) {
+                                    Ok(img) => {
+                                        ed.custom = Some(img);
+                                        ed.dirty = true;
+                                        ed.error = None;
+                                    }
+                                    Err(e) => {
+                                        ed.error = Some(format!("No se puede abrir la imagen: {e}"))
+                                    }
+                                }
+                            }
+                        }
+                        if ed.custom.is_some() && ui.button("Quitar").clicked() {
+                            ed.custom = None;
+                            ed.dirty = true;
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.weak(if ed.page.is_some() {
+                        "Se añadirá como primera página del PDF."
+                    } else {
+                        "Se guardará dentro del EPUB como portada."
+                    });
+                    ui.weak("Antes se guarda una copia del original.");
+                    if let Some(e) = &ed.error {
+                        ui.colored_label(Color32::from_rgb(180, 30, 30), e);
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("Añadir al libro").strong())
+                                    .fill(Color32::from_rgb(20, 90, 200)),
+                            )
+                            .clicked()
+                        {
+                            apply = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+        });
+        if apply {
+            let ed = self.cover_editor.as_mut().unwrap();
+            let e = &self.saved.library[ed.idx];
+            let path = PathBuf::from(&e.path);
+            let img = ed.render(1400);
+            let result = crate::cover::jpeg(&img).and_then(|jpg| match ed.page {
+                Some((pw, ph)) => {
+                    crate::cover::attach_pdf(&path, &jpg, img.width(), img.height(), pw, ph)
+                }
+                None => crate::cover::attach_epub(&path, &jpg),
+            });
+            match result {
+                Ok(()) => {
+                    let is_pdf = ed.page.is_some();
+                    let new_page = is_pdf || !ed.replacing;
+                    let e = &mut self.saved.library[ed.idx];
+                    if new_page && e.opened {
+                        if is_pdf {
+                            e.page += 1;
+                            for b in &mut e.bookmarks {
+                                b.0 += 1;
+                            }
+                        } else {
+                            e.chapter += 1;
+                            for b in &mut e.bookmarks {
+                                b.0 += 1;
+                            }
+                        }
+                    }
+                    let p = e.path.clone();
+                    self.requested.remove(&p);
+                    self.cover_tex.remove(&p);
+                    self.cover_editor = None;
+                    self.flash("Portada añadida al libro".into());
+                }
+                Err(err) => ed.error = Some(err),
+            }
+        } else if cancel || !open {
+            self.cover_editor = None;
         }
     }
 }

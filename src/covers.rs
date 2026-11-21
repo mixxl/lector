@@ -62,39 +62,61 @@ fn make_cover(path: &str) -> (Option<image::RgbaImage>, Option<(String, String)>
     }
 }
 
+fn process(path: &str, need_meta: bool) -> CoverResult {
+    let cf = cache_file(path);
+    let cached = cf
+        .as_ref()
+        .filter(|_| !need_meta)
+        .and_then(|f| image::open(f).ok())
+        .map(|i| i.to_rgba8());
+    let (img, meta) = match cached {
+        Some(i) => (Some(i), None),
+        None => {
+            let (img, meta) = make_cover(path);
+            if let (Some(i), Some(f)) = (&img, &cf) {
+                let _ = i.save(f);
+            }
+            (img, meta)
+        }
+    };
+    CoverResult {
+        path: path.to_string(),
+        image: img.map(to_color_image),
+        meta,
+    }
+}
+
 impl CoverWorker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let (tx, req) = channel::<(String, bool)>();
+        let req = std::sync::Arc::new(std::sync::Mutex::new(req));
         let (res, rx) = channel();
-        std::thread::spawn(move || {
-            while let Ok((path, need_meta)) = req.recv() {
-                let cf = cache_file(&path);
-                let cached = cf
-                    .as_ref()
-                    .filter(|_| !need_meta)
-                    .and_then(|f| image::open(f).ok())
-                    .map(|i| i.to_rgba8());
-                let (img, meta) = match cached {
-                    Some(i) => (Some(i), None),
-                    None => {
-                        let (img, meta) = make_cover(&path);
-                        if let (Some(i), Some(f)) = (&img, &cf) {
-                            let _ = i.save(f);
-                        }
-                        (img, meta)
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(2, 4);
+        for _ in 0..threads {
+            let req = req.clone();
+            let res = res.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let msg = req.lock().ok().and_then(|r| r.recv().ok());
+                    let Some((path, need_meta)) = msg else { return };
+                    let r = std::panic::catch_unwind(|| process(&path, need_meta)).unwrap_or(
+                        CoverResult {
+                            path: path.clone(),
+                            image: None,
+                            meta: None,
+                        },
+                    );
+                    if res.send(r).is_err() {
+                        return;
                     }
-                };
-                let r = CoverResult {
-                    path,
-                    image: img.map(to_color_image),
-                    meta,
-                };
-                if res.send(r).is_err() {
-                    return;
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            }
-        });
+            });
+        }
         CoverWorker { tx, rx }
     }
 

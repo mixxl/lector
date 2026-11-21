@@ -164,3 +164,10 @@ fn pdf_string(b: &[u8]) -> String {
         String::from_utf8_lossy(b).trim().to_string()
     }
 }
+
+pub fn first_page_size(path: &str) -> Option<(f32, f32)> {
+    let data = std::fs::read(path).ok()?;
+    let pdf = Pdf::new(Arc::new(data)).ok()?;
+    let p = pdf.pages().first()?;
+    Some(p.render_dimensions())
+}

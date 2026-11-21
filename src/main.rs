@@ -2,6 +2,7 @@
 
 mod app;
 mod book;
+mod cover;
 mod covers;
 mod epub;
 mod layout;

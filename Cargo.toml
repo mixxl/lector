@@ -14,6 +14,8 @@ roxmltree = "0.21.2"
 serde = { version = "1.0.229", features = ["derive"] }
 zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 dirs = "7.0.0"
+lopdf = { version = "0.47", default-features = false }
+ab_glyph = "0.2.32"
 
 [features]
 default = ["wgpu"]

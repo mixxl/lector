@@ -45,6 +45,41 @@ impl Archive {
         }
     }
 
+    pub fn find_ext(&mut self, ext: &str) -> Option<String> {
+        match self {
+            Archive::Zip(z) => z
+                .file_names()
+                .filter_map(|n| n.ok())
+                .find(|n| n.to_lowercase().ends_with(ext))
+                .map(|n| n.to_string()),
+            Archive::Dir(base) => {
+                fn walk(d: &Path, base: &Path, ext: &str, depth: usize) -> Option<String> {
+                    if depth > 3 {
+                        return None;
+                    }
+                    for e in std::fs::read_dir(d).ok()?.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            if let Some(r) = walk(&p, base, ext, depth + 1) {
+                                return Some(r);
+                            }
+                        } else if p.to_string_lossy().to_lowercase().ends_with(ext) {
+                            return Some(
+                                p.strip_prefix(base)
+                                    .ok()?
+                                    .to_string_lossy()
+                                    .replace('\\', "/"),
+                            );
+                        }
+                    }
+                    None
+                }
+                let b = base.clone();
+                walk(&b, &b, ext, 0)
+            }
+        }
+    }
+
     pub fn read_string(&mut self, name: &str) -> Option<String> {
         let b = self.read(name)?;
         Some(String::from_utf8_lossy(&b).into_owned())
@@ -126,17 +161,50 @@ pub fn quick_info(path: &Path) -> Option<(String, String, Option<Vec<u8>>)> {
     let opf_path = find_opf(&mut ar)?;
     let opf = ar.read_string(&opf_path)?;
     let pkg = parse_opf(&opf, &opf_path)?;
-    let cover = pkg.cover.as_ref().and_then(|c| ar.read(c));
+    let decodes = |b: &Vec<u8>| image::guess_format(b).is_ok();
+    let mut cover = pkg.cover.as_ref().and_then(|c| ar.read(c)).filter(decodes);
+    if cover.is_none() {
+        for page in &pkg.cover_pages {
+            let Some(html) = ar.read_string(page) else {
+                continue;
+            };
+            let base = dir_of(page);
+            let img = tokenize(&html).into_iter().find_map(|t| match t {
+                Tok::Open { name, attrs, .. } if name == "img" || name == "image" => {
+                    attr(&attrs, "src").or_else(|| attr(&attrs, "href"))
+                }
+                _ => None,
+            });
+            if let Some(src) = img {
+                if let Some(b) = ar
+                    .read(&join_path(&base, &percent_decode(&src)))
+                    .filter(decodes)
+                {
+                    cover = Some(b);
+                    break;
+                }
+            }
+        }
+    }
     Some((pkg.title, pkg.author, cover))
 }
 
 fn find_opf(ar: &mut Archive) -> Option<String> {
-    let container = ar.read_string("META-INF/container.xml")?;
-    let doc = parse_xml(&container)?;
-    let rf = doc
-        .descendants()
-        .find(|n| n.tag_name().name() == "rootfile")?;
-    Some(percent_decode(rf.attribute("full-path")?))
+    let container = ar.read_string("META-INF/container.xml");
+    if let Some(container) = container {
+        let fixed = sanitize_xml(&container);
+        if let Some(doc) = parse_xml(&fixed) {
+            if let Some(p) = doc
+                .descendants()
+                .find(|n| n.tag_name().name() == "rootfile")
+                .and_then(|rf| rf.attribute("full-path"))
+            {
+                return Some(percent_decode(p));
+            }
+        }
+    }
+    // sin container.xml válido: busca cualquier .opf
+    ar.find_ext(".opf")
 }
 
 fn parse_xml(s: &str) -> Option<roxmltree::Document<'_>> {
@@ -147,17 +215,61 @@ fn parse_xml(s: &str) -> Option<roxmltree::Document<'_>> {
     roxmltree::Document::parse_with_options(s, opts).ok()
 }
 
+/// Arregla XML "casi válido": entidades HTML (&nbsp;…), BOM, basura inicial.
+fn sanitize_xml(s: &str) -> String {
+    let s = s.trim_start_matches('\u{feff}');
+    let s = match s.find('<') {
+        Some(i) => &s[i..],
+        None => s,
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find('&') {
+        out.push_str(&rest[..p]);
+        rest = &rest[p..];
+        match rest[..rest.len().min(12)].find(';') {
+            Some(e) => {
+                let ent = &rest[1..e];
+                if matches!(ent, "amp" | "lt" | "gt" | "quot" | "apos") || ent.starts_with('#') {
+                    out.push_str(&rest[..=e]);
+                } else if let Some(c) = named_entity(ent) {
+                    out.push_str(&format!("&#{};", c as u32));
+                } else {
+                    out.push_str("&amp;");
+                    out.push_str(&rest[1..=e]);
+                }
+                rest = &rest[e + 1..];
+            }
+            None => {
+                out.push_str("&amp;");
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 struct Package {
     title: String,
     author: String,
     spine: Vec<String>,
     cover: Option<String>,
+    cover_pages: Vec<String>,
     nav: Option<String>,
     ncx: Option<String>,
 }
 
 fn parse_opf(opf: &str, opf_path: &str) -> Option<Package> {
+    if let Some(p) = parse_opf_doc(opf, opf_path) {
+        return Some(p);
+    }
+    parse_opf_doc(&sanitize_xml(opf), opf_path)
+}
+
+fn parse_opf_doc(opf: &str, opf_path: &str) -> Option<Package> {
     let doc = parse_xml(opf)?;
+    let mut guide_cover: Option<String> = None;
     let base = dir_of(opf_path);
     let mut title = String::new();
     let mut author = String::new();
@@ -185,6 +297,19 @@ fn parse_opf(opf: &str, opf_path: &str) -> Option<Package> {
                 }
             }
             "spine" => toc_id = n.attribute("toc").map(|s| s.to_string()),
+            "reference" => {
+                let t = n.attribute("type").unwrap_or("").to_lowercase();
+                if guide_cover.is_none()
+                    && (t == "cover" || t == "title-page" && guide_cover.is_none())
+                {
+                    if let Some(h) = n.attribute("href") {
+                        guide_cover = Some(join_path(
+                            &base,
+                            &percent_decode(h.split('#').next().unwrap_or(h)),
+                        ));
+                    }
+                }
+            }
             "itemref" => {
                 if let Some(id) = n.attribute("idref") {
                     spine_ids.push(id.to_string())
@@ -193,7 +318,7 @@ fn parse_opf(opf: &str, opf_path: &str) -> Option<Package> {
             _ => {}
         }
     }
-    let spine = spine_ids
+    let spine: Vec<String> = spine_ids
         .iter()
         .filter_map(|id| manifest.get(id).map(|m| m.0.clone()))
         .collect();
@@ -209,9 +334,25 @@ fn parse_opf(opf: &str, opf_path: &str) -> Option<Package> {
     if cover.is_none() {
         cover = manifest
             .iter()
-            .find(|(id, m)| id.to_lowercase().contains("cover") && m.1.starts_with("image/"))
+            .find(|(id, m)| {
+                (id.to_lowercase().contains("cover")
+                    || m.0.to_lowercase().contains("cover")
+                    || m.0.to_lowercase().contains("portada"))
+                    && m.1.starts_with("image/")
+            })
             .map(|(_, m)| m.0.clone());
     }
+    // páginas HTML donde buscar la imagen de portada si no hay otra pista
+    let mut cover_pages: Vec<String> = Vec::new();
+    if let Some(g) = guide_cover {
+        cover_pages.push(g);
+    }
+    cover_pages.extend(
+        manifest
+            .values()
+            .filter(|m| m.1.contains("html") && m.0.to_lowercase().contains("cover"))
+            .map(|m| m.0.clone()),
+    );
     let nav = manifest
         .values()
         .find(|m| m.2.split_whitespace().any(|p| p == "nav"))
@@ -224,11 +365,13 @@ fn parse_opf(opf: &str, opf_path: &str) -> Option<Package> {
                 .find(|m| m.1 == "application/x-dtbncx+xml")
                 .map(|m| m.0.clone())
         });
+    cover_pages.extend(spine.iter().take(2).cloned());
     Some(Package {
         title,
         author,
         spine,
         cover,
+        cover_pages,
         nav,
         ncx,
     })
@@ -997,4 +1140,8 @@ mod tests {
         assert_eq!(c.blocks.len(), 3);
         assert_eq!(c.anchors["c1"], 0);
     }
+}
+
+pub fn find_opf_path(ar: &mut Archive) -> Option<String> {
+    find_opf(ar)
 }
