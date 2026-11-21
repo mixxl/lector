@@ -16,6 +16,16 @@ zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 dirs = "7.0.0"
 lopdf = { version = "0.47", default-features = false }
 ab_glyph = "0.2.32"
+pdf-extract = "0.12"
+mobi = "0.8"
+hyphenation = { version = "0.8", features = ["embed_all"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSURL", "NSString", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder"] }
 
 [features]
 default = ["wgpu"]

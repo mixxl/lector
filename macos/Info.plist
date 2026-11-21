@@ -13,6 +13,30 @@
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.books</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Libro EPUB</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>org.idpf.epub-container</string><string>org.idpf.epub-folder</string></array>
+      <key>CFBundleTypeExtensions</key><array><string>epub</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Documento PDF</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>com.adobe.pdf</string></array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Libro Kindle / cómic</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array><string>mobi</string><string>azw</string><string>azw3</string><string>prc</string><string>cbz</string></array>
+    </dict>
+  </array>
   <key>NSHumanReadableCopyright</key><string>Concepto Estudio Gráfico</string>
 </dict>
 </plist>

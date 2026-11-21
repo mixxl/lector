@@ -12,6 +12,15 @@ Lector de **PDF y EPUB** escrito en **Rust puro**, pensado para que leer en pant
 - **Biblioteca** con portadas al estilo de Apple Books, búsqueda, progreso y recuerdo de la última página. Puede **importar los libros de Apple Books**.
 - **Portadas**: detecta la portada aunque el EPUB la declare de forma poco estándar. Si un libro no tiene, puedes **crearla** (diseño tipográfico con 6 estilos o una imagen tuya) y **añadirla al propio archivo**: dentro del EPUB o como primera página del PDF. Se guarda antes una copia del original en `~/Library/Application Support/Lector/copias`.
 - Botón **«Ver una página / Ver dos páginas»** en la barra del lector.
+- **Subrayados y notas**: arrastra sobre el texto para seleccionarlo; 4 colores, notas, panel de notas y **exportación a Markdown**. En PDF, notas por página.
+- **Guiones en español** (y en, fr, de, it, pt, ca) para un justificado sin huecos.
+- **Búsqueda dentro del libro** (EPUB, MOBI y PDF) con contexto y salto al resultado (⌘F).
+- **Diccionario** de macOS, **RAE**, **traductor** y **lectura en voz alta** con las voces del sistema (pasa sola de página).
+- **Estilo del editor**: opción para respetar alineaciones, sangrías y tamaños del propio libro.
+- **PDF**: índice (marcadores del PDF), recorte automático de márgenes y desplazamiento continuo.
+- **Formatos**: EPUB, PDF, MOBI/AZW/AZW3 sin DRM y cómics CBZ.
+- **Estadísticas**: minutos de lectura al día, objetivo diario, racha, gráfico de 30 días y libros terminados en el año.
+- **Abrir desde Finder** con doble clic o «Abrir con» y **editar los datos** de cada libro (título, autor, temas).
 - Índice, marcadores (cinta roja en la página) y barra de progreso.
 
 ## Atajos
@@ -25,6 +34,7 @@ Lector de **PDF y EPUB** escrito en **Rust puro**, pensado para que leer en pant
 | B | Marcar página |
 | F | Pantalla completa |
 | ⌘+ / ⌘− | Tamaño de letra (EPUB) o zoom (PDF) |
+| ⌘F | Buscar en el libro |
 | Esc | Cerrar paneles o volver a la biblioteca |
 
 También puedes arrastrar archivos o carpetas a la ventana.

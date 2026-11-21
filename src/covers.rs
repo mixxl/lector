@@ -43,6 +43,13 @@ fn to_color_image(img: image::RgbaImage) -> ColorImage {
 
 fn make_meta(path: &str) -> Option<crate::epub::Info> {
     let p = Path::new(path);
+    if crate::pdfdoc::is_cbz(path) {
+        return Some(crate::epub::Info {
+            title: String::new(),
+            author: String::new(),
+            subjects: vec![],
+        });
+    }
     if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
         let data = std::fs::read(p).ok()?;
         let title = crate::pdfdoc::title(&data).unwrap_or_default();
@@ -59,6 +66,22 @@ fn make_meta(path: &str) -> Option<crate::epub::Info> {
 fn make_cover(path: &str) -> (Option<image::RgbaImage>, Option<crate::epub::Info>) {
     let p = Path::new(path);
     let is_pdf = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if crate::pdfdoc::is_cbz(path) {
+        let img = std::fs::read(p)
+            .ok()
+            .and_then(|d| crate::pdfdoc::cbz_images(&d))
+            .and_then(|v| v.into_iter().next())
+            .and_then(|b| image::load_from_memory(&b).ok())
+            .map(|i| i.thumbnail(THUMB_W, THUMB_W * 2).to_rgba8());
+        return (
+            img,
+            Some(crate::epub::Info {
+                title: String::new(),
+                author: String::new(),
+                subjects: vec![],
+            }),
+        );
+    }
     if is_pdf {
         let Ok(data) = std::fs::read(p) else {
             return (None, None);
@@ -183,7 +206,10 @@ pub fn scan(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
         if name.starts_with('.') {
             continue;
         }
-        if name.ends_with(".epub") || name.ends_with(".pdf") {
+        if [".epub", ".pdf", ".mobi", ".azw", ".azw3", ".prc", ".cbz"]
+            .iter()
+            .any(|e| name.ends_with(e))
+        {
             out.push(p);
         } else if p.is_dir() {
             scan(&p, out, depth + 1);

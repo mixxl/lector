@@ -1,8 +1,9 @@
 use crate::book::{self, Flip, Side, Theme};
 use crate::covers::{self, CoverWorker};
 use crate::epub::{self, Epub};
-use crate::layout::{self, Item, Layout, Params};
+use crate::layout::{self, Item, Layout, Params, TextPos};
 use crate::pdfdoc::{Msg, PdfWorker};
+use crate::tools;
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Key, Mesh, Pos2, Rect, Sense, Shape, TextureHandle,
     TextureOptions, Vec2, pos2, vec2,
@@ -27,6 +28,12 @@ pub struct Settings {
     pub page_mode: u8,
     pub cover_alone: bool,
     pub animate: bool,
+    pub hyphenate: bool,
+    pub publisher: bool,
+    pub tts_rate: u32,
+    pub pdf_crop: bool,
+    pub pdf_scroll: bool,
+    pub goal_min: u32,
 }
 
 impl Default for Settings {
@@ -41,6 +48,12 @@ impl Default for Settings {
             page_mode: 0,
             cover_alone: true,
             animate: true,
+            hyphenate: true,
+            publisher: false,
+            tts_rate: 185,
+            pdf_crop: false,
+            pdf_scroll: false,
+            goal_min: 20,
         }
     }
 }
@@ -67,6 +80,48 @@ pub struct Entry {
     pub collections: Vec<String>,
     pub finished: bool,
     pub meta_v: u8,
+    pub notes: Vec<Note>,
+    pub finished_at: u64,
+}
+
+/// Subrayado con nota opcional. En PDF: nota de página (chapter = página).
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct Note {
+    pub chapter: usize,
+    pub block: usize,
+    pub start: usize,
+    pub end_block: usize,
+    pub end: usize,
+    pub color: u8,
+    pub text: String,
+    pub note: String,
+    pub created: u64,
+}
+
+impl Note {
+    fn from(&self) -> TextPos {
+        (self.chapter, self.block, self.start)
+    }
+    fn to(&self) -> TextPos {
+        (self.chapter, self.end_block, self.end)
+    }
+}
+
+pub const NOTE_COLORS: [(u8, u8, u8); 4] = [
+    (255, 214, 80),
+    (140, 220, 120),
+    (130, 190, 255),
+    (255, 150, 190),
+];
+
+fn note_fill(c: u8, night: bool) -> Color32 {
+    let (r, g, b) = NOTE_COLORS[c as usize % 4];
+    if night {
+        Color32::from_rgba_unmultiplied(r, g, b, 70)
+    } else {
+        Color32::from_rgba_unmultiplied(r, g, b, 110)
+    }
 }
 
 impl Entry {
@@ -98,17 +153,19 @@ enum Filter {
     Temas,
     Tema(String),
     Coleccion(String),
+    Estadisticas,
 }
 
 impl Filter {
     fn title(&self) -> String {
         match self {
             Filter::Todo => "Todo".into(),
+            Filter::Estadisticas => "Lectura".into(),
             Filter::Leyendo => "Leyendo".into(),
             Filter::ParaLeer => "Para leer".into(),
             Filter::Terminados => "Terminados".into(),
             Filter::Libros => "Libros".into(),
-            Filter::Pdf => "PDF".into(),
+            Filter::Pdf => "PDF y cómics".into(),
             Filter::Autores => "Autores".into(),
             Filter::Temas => "Temas".into(),
             Filter::Autor(a) | Filter::Tema(a) | Filter::Coleccion(a) => a.clone(),
@@ -116,7 +173,7 @@ impl Filter {
     }
     fn matches(&self, e: &Entry) -> bool {
         match self {
-            Filter::Todo | Filter::Autores | Filter::Temas => true,
+            Filter::Todo | Filter::Autores | Filter::Temas | Filter::Estadisticas => true,
             Filter::Leyendo => e.is_reading(),
             Filter::ParaLeer => !e.opened && !e.is_finished(),
             Filter::Terminados => e.is_finished(),
@@ -136,6 +193,8 @@ struct Saved {
     library: Vec<Entry>,
     collections: Vec<String>,
     sort: u8,
+    /// segundos leídos por día (AAAA-MM-DD)
+    stats: std::collections::BTreeMap<String, u32>,
 }
 
 fn now() -> u64 {
@@ -157,6 +216,8 @@ struct PdfState {
     pan: Vec2,
     tex_night: bool,
     error: Option<String>,
+    outline: std::sync::Arc<std::sync::Mutex<Option<Vec<(String, usize, usize)>>>>,
+    crops: HashMap<usize, Rect>,
 }
 
 struct EpubState {
@@ -195,6 +256,51 @@ struct Reader {
     scroll_acc: Vec2,
     last_turn: f64,
     slider: Option<f32>,
+    /// selección de texto en curso (ancla, cabeza)
+    sel: Option<(TextPos, TextPos)>,
+    selecting: bool,
+    popup: Option<Popup>,
+    note_edit: Option<NoteEdit>,
+    /// 0 índice, 1 notas, 2 buscar
+    panel_tab: u8,
+    search_q: String,
+    search_results: Vec<SearchHit>,
+    search_hit: Option<(TextPos, TextPos)>,
+    search_pending: bool,
+    pdf_text: Option<std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>>,
+    tts: Option<std::process::Child>,
+    tts_on: bool,
+    tts_page: Option<usize>,
+    /// desplazamiento vertical en modo continuo (PDF)
+    scroll_y: f32,
+    scroll_page: Option<usize>,
+}
+
+#[derive(Clone)]
+struct SearchHit {
+    pos: TextPos,
+    len: usize,
+    page: usize,
+    context: String,
+}
+
+#[derive(Clone)]
+enum PopupKind {
+    New(TextPos, TextPos),
+    Existing(usize),
+}
+
+#[derive(Clone)]
+struct Popup {
+    pos: Pos2,
+    kind: PopupKind,
+}
+
+struct NoteEdit {
+    /// índice de la nota (None: nueva nota de página en PDF)
+    idx: Option<usize>,
+    page: usize,
+    text: String,
 }
 
 pub struct App {
@@ -211,6 +317,17 @@ pub struct App {
     filter: Filter,
     new_collection: Option<String>,
     meta_requested: HashSet<String>,
+    stat_tick: Option<std::time::Instant>,
+    stat_acc: f32,
+    meta_editor: Option<(usize, String, String, String)>,
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.tts.take() {
+            let _ = c.kill();
+        }
+    }
 }
 
 struct CoverEditor {
@@ -266,14 +383,20 @@ impl App {
             filter: Filter::Todo,
             new_collection: None,
             meta_requested: HashSet::new(),
+            stat_tick: None,
+            stat_acc: 0.0,
+            meta_editor: None,
         }
     }
 
     fn add_path(&mut self, p: &Path) -> Option<usize> {
         let s = p.to_string_lossy().to_string();
         let lower = s.to_lowercase();
-        let is_pdf = lower.ends_with(".pdf");
-        if !is_pdf && !lower.ends_with(".epub") {
+        let is_pdf = lower.ends_with(".pdf") || lower.ends_with(".cbz");
+        let book = [".epub", ".mobi", ".azw", ".azw3", ".prc"]
+            .iter()
+            .any(|e| lower.ends_with(e));
+        if !is_pdf && !book {
             return None;
         }
         if let Some(i) = self.saved.library.iter().position(|e| e.path == s) {
@@ -314,7 +437,23 @@ impl App {
         let doc = if e.is_pdf {
             match std::fs::read(&path) {
                 Ok(data) => Doc::Pdf(PdfState {
-                    worker: PdfWorker::spawn(data, ctx.clone()),
+                    outline: start_pdf_outline(if crate::pdfdoc::is_cbz(&e.path) {
+                        vec![]
+                    } else {
+                        data.clone()
+                    }),
+                    crops: HashMap::new(),
+                    worker: if crate::pdfdoc::is_cbz(&e.path) {
+                        match crate::pdfdoc::cbz_images(&data) {
+                            Some(imgs) => PdfWorker::spawn_images(imgs, String::new(), ctx.clone()),
+                            None => {
+                                self.flash("El CBZ no contiene imágenes".into());
+                                return;
+                            }
+                        }
+                    } else {
+                        PdfWorker::spawn(data, ctx.clone())
+                    },
                     sizes: vec![],
                     tex: HashMap::new(),
                     pending: HashMap::new(),
@@ -364,12 +503,30 @@ impl App {
             scroll_acc: Vec2::ZERO,
             last_turn: 0.0,
             slider: None,
+            sel: None,
+            selecting: false,
+            popup: None,
+            note_edit: None,
+            panel_tab: 0,
+            search_q: String::new(),
+            search_results: vec![],
+            search_hit: None,
+            search_pending: false,
+            pdf_text: None,
+            tts: None,
+            tts_on: false,
+            tts_page: None,
+            scroll_y: 0.0,
+            scroll_page: None,
         });
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         if let Some(files) = rfd::FileDialog::new()
-            .add_filter("Libros", &["pdf", "epub"])
+            .add_filter(
+                "Libros",
+                &["pdf", "epub", "mobi", "azw", "azw3", "prc", "cbz"],
+            )
             .set_title("Abrir libro")
             .pick_files()
         {
@@ -456,7 +613,10 @@ impl eframe::App for App {
         }
         // archivos por línea de comandos
         // archivos o carpetas por línea de comandos: uno solo se abre, varios se añaden
-        let initial = std::mem::take(&mut self.initial);
+        #[allow(unused_mut)]
+        let mut initial = std::mem::take(&mut self.initial);
+        #[cfg(target_os = "macos")]
+        initial.extend(crate::macos::take_opened());
         let mut books = Vec::new();
         for p in &initial {
             let p = PathBuf::from(p);
@@ -526,10 +686,12 @@ impl eframe::App for App {
         }
 
         if self.reader.is_some() {
+            self.track_reading(&ctx);
             self.reader_ui(ui);
         } else {
             self.library_ui(ui);
             self.cover_editor_ui(&ctx);
+            self.meta_editor_ui(&ctx);
         }
 
         if let Some((msg, t0)) = &mut self.message {
@@ -610,6 +772,8 @@ impl App {
 
         // ---- menú lateral
         let mut new_filter: Option<Filter> = None;
+        let today_min = self.today_minutes();
+        let goal_min = self.saved.settings.goal_min;
         let mut delete_collection: Option<String> = None;
         let current = self.filter.clone();
         egui::Panel::left("menu")
@@ -627,6 +791,56 @@ impl App {
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(10.0);
+                // tarjeta de lectura de hoy
+                let (card, cresp) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
+                let cp = ui.painter();
+                cp.rect_filled(
+                    card,
+                    8.0,
+                    if current == Filter::Estadisticas {
+                        Color32::from_rgb(214, 211, 206)
+                    } else {
+                        Color32::from_rgb(246, 244, 240)
+                    },
+                );
+                cp.text(
+                    card.left_top() + vec2(10.0, 8.0),
+                    Align2::LEFT_TOP,
+                    "Lectura de hoy",
+                    FontId::proportional(13.0),
+                    Color32::from_gray(90),
+                );
+                cp.text(
+                    card.right_top() + vec2(-10.0, 8.0),
+                    Align2::RIGHT_TOP,
+                    format!("{} / {} min", today_min, goal_min),
+                    FontId::proportional(13.0),
+                    Color32::from_rgb(30, 30, 30),
+                );
+                let bar = Rect::from_min_size(
+                    card.left_top() + vec2(10.0, 32.0),
+                    vec2(card.width() - 20.0, 8.0),
+                );
+                cp.rect_filled(bar, 4.0, Color32::from_gray(220));
+                cp.rect_filled(
+                    Rect::from_min_size(
+                        bar.min,
+                        vec2(
+                            bar.width() * (today_min as f32 / goal_min.max(1) as f32).min(1.0),
+                            8.0,
+                        ),
+                    ),
+                    4.0,
+                    Color32::from_rgb(130, 30, 30),
+                );
+                if cresp
+                    .on_hover_text("Estadísticas y objetivo de lectura")
+                    .clicked()
+                {
+                    new_filter = Some(Filter::Estadisticas);
+                }
+                ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
@@ -685,7 +899,7 @@ impl App {
                         row(ui, Filter::Terminados, "Terminados", counts[2]);
                         row(ui, Filter::Todo, "Todo", n_total);
                         row(ui, Filter::Libros, "Libros", counts[3]);
-                        row(ui, Filter::Pdf, "PDF", counts[4]);
+                        row(ui, Filter::Pdf, "PDF y cómics", counts[4]);
                         head(ui, "Explorar");
                         row(ui, Filter::Autores, "Autores", auth_sorted.len());
                         row(ui, Filter::Temas, "Temas", subj_sorted.len());
@@ -774,7 +988,10 @@ impl App {
             }
         });
         let n_pdf_shown = order.iter().filter(|&&i| lib[i].is_pdf).count();
-        let list_mode = matches!(self.filter, Filter::Autores | Filter::Temas);
+        let list_mode = matches!(
+            self.filter,
+            Filter::Autores | Filter::Temas | Filter::Estadisticas
+        );
 
         egui::Panel::top("cabecera")
             .frame(egui::Frame::new().fill(bg).inner_margin(egui::Margin {
@@ -828,6 +1045,7 @@ impl App {
                 let sub = match self.filter {
                     Filter::Autores => format!("{} autores", auth_sorted.len()),
                     Filter::Temas => format!("{} temas", subj_sorted.len()),
+                    Filter::Estadisticas => "Tu tiempo de lectura".to_string(),
                     _ => format!(
                         "{} libros, {} archivos PDF",
                         order.len() - n_pdf_shown,
@@ -854,6 +1072,10 @@ impl App {
                                 .color(Color32::GRAY),
                         );
                     });
+                    return;
+                }
+                if self.filter == Filter::Estadisticas {
+                    self.stats_ui(ui);
                     return;
                 }
                 // ---- vista de autores / temas
@@ -951,6 +1173,7 @@ impl App {
                                             }
                                         } else {
                                             e.finished = true;
+                                            e.finished_at = now();
                                         }
                                         ui.close();
                                     }
@@ -970,7 +1193,12 @@ impl App {
                                             ui.weak("Crea una con «+ Nueva colección»");
                                         }
                                     });
-                                    ui.separator();
+                                    if ui.button("Editar datos…").clicked() {
+                                            let e = &self.saved.library[i];
+                                            self.meta_editor = Some((i, e.title.clone(), e.author.clone(), e.subjects.join(", ")));
+                                            ui.close();
+                                        }
+                                        ui.separator();
                                     #[cfg(target_os = "macos")]
                                     if ui.button("Mostrar en Finder").clicked() {
                                         let _ = std::process::Command::new("open")
@@ -1177,11 +1405,15 @@ impl App {
                 );
             }
         }
-        if e.is_pdf {
+        let ext = Path::new(&e.path)
+            .extension()
+            .map(|x| x.to_string_lossy().to_uppercase())
+            .unwrap_or_default();
+        if ext != "EPUB" {
             p.text(
                 pos2(rect.right(), y),
                 Align2::RIGHT_TOP,
-                "PDF",
+                ext,
                 FontId::proportional(11.0),
                 Color32::GRAY,
             );
@@ -1228,6 +1460,9 @@ impl App {
             if total > 0 {
                 e.progress = ((r.page + 1) as f32 / total as f32).min(1.0);
             }
+            if e.is_finished() && e.finished_at == 0 {
+                e.finished_at = now();
+            }
         }
     }
 }
@@ -1266,10 +1501,13 @@ impl App {
         let mut toggle_bookmark = false;
         let mut jump: Option<usize> = None;
         let mut jump_anchor: Option<(usize, usize)> = None;
+        let mut note_ops: Vec<NoteOp> = Vec::new();
+        let mut do_search = false;
 
         let reader = self.reader.as_mut().unwrap();
         let entry = &self.saved.library[reader.entry];
         let bookmarks = entry.bookmarks.clone();
+        let notes = entry.notes.clone();
 
         // ---- mensajes del PDF
         if let Doc::Pdf(pdf) = &mut reader.doc {
@@ -1309,6 +1547,11 @@ impl App {
                         let t =
                             ctx.load_texture(format!("pdf{}", r.page), img, TextureOptions::LINEAR);
                         pdf.tex.insert(r.page, (t, r.scale));
+                        let c = r.crop;
+                        pdf.crops.insert(
+                            r.page,
+                            Rect::from_min_max(pos2(c[0], c[1]), pos2(c[2], c[3])),
+                        );
                     }
                     Msg::Error(e) => pdf.error = Some(e),
                 }
@@ -1321,11 +1564,13 @@ impl App {
 
         // ---- área útil y modo de página
         let area = full.shrink2(vec2(14.0, 16.0));
-        let double = match settings.page_mode {
-            1 => false,
-            2 => true,
-            _ => area.width() > area.height() * 1.15,
-        };
+        let scroll_mode = settings.pdf_scroll && matches!(reader.doc, Doc::Pdf(_));
+        let double = !scroll_mode
+            && match settings.page_mode {
+                1 => false,
+                2 => true,
+                _ => area.width() > area.height() * 1.15,
+            };
 
         // ---- EPUB: paginación
         let is_pdf = matches!(reader.doc, Doc::Pdf(_));
@@ -1351,6 +1596,8 @@ impl App {
                 line_spacing: settings.line_spacing,
                 sans: settings.sans,
                 justify: settings.justify,
+                hyphenate: settings.hyphenate,
+                publisher: settings.publisher,
                 ppp,
             };
             let need = ep
@@ -1430,6 +1677,10 @@ impl App {
         } else {
             Vec2::ZERO
         };
+        let pdf_crops: HashMap<usize, Rect> = match &reader.doc {
+            Doc::Pdf(p) if settings.pdf_crop => p.crops.clone(),
+            _ => HashMap::new(),
+        };
         let pdf_sizes: Option<Vec<(f32, f32)>> = match &reader.doc {
             Doc::Pdf(p) => Some(p.sizes.clone()),
             _ => None,
@@ -1438,7 +1689,13 @@ impl App {
             let (l, r) = sp.pages(s);
             let size_of = |p: usize| -> Vec2 {
                 match &pdf_sizes {
-                    Some(sz) => vec2(sz[p].0, sz[p].1),
+                    Some(sz) => {
+                        let c = pdf_crops
+                            .get(&p)
+                            .copied()
+                            .unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+                        vec2(sz[p].0 * c.width(), sz[p].1 * c.height())
+                    }
                     None => epub_page(area, double),
                 }
             };
@@ -1472,14 +1729,165 @@ impl App {
             }
         };
         let g = geo(cur_spread);
+        // ---- PDF en desplazamiento continuo
+        if scroll_mode {
+            if let Some(t) = reader.turn.take() {
+                let s = if t.target.unwrap_or(t.theta) > 1.5 {
+                    t.a + 1
+                } else {
+                    t.a
+                };
+                reader.page = s.min(n_pages - 1);
+            }
+            let sizes = pdf_sizes.clone().unwrap_or_default();
+            let col_w = (area.width() * 0.72).min(area.height() * 1.1).max(200.0) * zoom;
+            let gap = 18.0;
+            let mut tops = Vec::with_capacity(sizes.len() + 1);
+            let mut y = 0.0;
+            let dims: Vec<Vec2> = (0..sizes.len())
+                .map(|p| {
+                    let c = pdf_crops
+                        .get(&p)
+                        .copied()
+                        .unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+                    let (w, h) = sizes[p];
+                    let (w, h) = (w * c.width(), h * c.height());
+                    vec2(col_w, col_w * h / w.max(1.0))
+                })
+                .collect();
+            for d in &dims {
+                tops.push(y);
+                y += d.y + gap;
+            }
+            let total = y;
+            // salto externo (índice, barra, teclas)
+            if reader.scroll_page != Some(reader.page) {
+                reader.scroll_y = tops.get(reader.page).copied().unwrap_or(0.0) - 10.0;
+            }
+            let inp = ctx.input(|i| {
+                (
+                    i.smooth_scroll_delta,
+                    i.key_pressed(Key::ArrowDown),
+                    i.key_pressed(Key::ArrowUp),
+                )
+            });
+            let (pointer_in, drag_dy) = ctx.input(|i| {
+                let inside = i.pointer.hover_pos().is_some_and(|p| area.contains(p));
+                let dy = if i.pointer.primary_down() && i.pointer.is_decidedly_dragging() {
+                    i.pointer.delta().y
+                } else {
+                    0.0
+                };
+                (inside, dy)
+            });
+            if pointer_in && !reader.show_toc && !reader.show_settings {
+                reader.scroll_y -= inp.0.y;
+                if zoom > 1.01 {
+                    if let Doc::Pdf(p) = &mut reader.doc {
+                        p.pan.x += inp.0.x;
+                    }
+                }
+            }
+            if pointer_in {
+                reader.scroll_y -= drag_dy;
+            }
+            if inp.1 {
+                reader.scroll_y += 80.0;
+            }
+            if inp.2 {
+                reader.scroll_y -= 80.0;
+            }
+            reader.scroll_y = reader
+                .scroll_y
+                .clamp(-20.0, (total - area.height()).max(0.0) + 20.0);
+            let cx = area.center().x + pan.x;
+            let mid = reader.scroll_y + area.height() * 0.4;
+            let cur = tops.iter().rposition(|t| *t <= mid).unwrap_or(0);
+            reader.page = cur;
+            reader.scroll_page = Some(cur);
+            let mut want = Vec::new();
+            for (p, d) in dims.iter().enumerate() {
+                let top = area.top() + tops[p] - reader.scroll_y;
+                let r = Rect::from_min_size(pos2(cx - d.x / 2.0, top), *d);
+                if r.bottom() < full.top() - 600.0 || r.top() > full.bottom() + 600.0 {
+                    continue;
+                }
+                if let Doc::Pdf(_) = &reader.doc {
+                    let (w, h) = sizes[p];
+                    let ch = pdf_crops.get(&p).map(|c| c.height()).unwrap_or(1.0);
+                    let s = (d.y * ppp / (h * ch)).min(5000.0 / w.max(h)).max(0.05);
+                    want.push((p, s));
+                }
+                if r.bottom() < full.top() || r.top() > full.bottom() {
+                    continue;
+                }
+                painter.add(
+                    egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(90),
+                    }
+                    .as_shape(r, 2.0),
+                );
+                let tint = tint_for(settings.theme);
+                painter.rect_filled(
+                    r,
+                    0.0,
+                    if th.night {
+                        Color32::from_gray(28)
+                    } else {
+                        tint
+                    },
+                );
+                if let Doc::Pdf(pdf) = &reader.doc {
+                    if let Some((t, _)) = pdf.tex.get(&p) {
+                        let uv = pdf_crops
+                            .get(&p)
+                            .copied()
+                            .unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+                        painter.image(t.id(), r, uv, tint);
+                    }
+                }
+            }
+            if let Doc::Pdf(pdf) = &mut reader.doc {
+                let ok = |v: Option<f32>, s: f32| {
+                    v.is_some_and(|v| (v / s - 1.0).abs() < 0.2 || (v > s && v / s < 1.6))
+                };
+                let missing: Vec<(usize, f32)> = want
+                    .iter()
+                    .filter(|(p, s)| !ok(pdf.tex.get(p).map(|t| t.1), *s))
+                    .copied()
+                    .collect();
+                let same = missing.len() == pdf.pending.len()
+                    && missing
+                        .iter()
+                        .all(|(p, s)| ok(pdf.pending.get(p).copied(), *s));
+                if !same {
+                    pdf.pending = missing.iter().copied().collect();
+                    if !missing.is_empty() {
+                        pdf.worker.request(missing);
+                    }
+                }
+                if pdf.tex.len() > 16 {
+                    let keep: HashSet<usize> = want.iter().map(|w| w.0).collect();
+                    pdf.tex.retain(|k, _| keep.contains(k));
+                }
+            }
+        }
 
         // ---- PDF: peticiones de renderizado
-        if let Doc::Pdf(pdf) = &mut reader.doc {
+        if let (Doc::Pdf(pdf), false) = (&mut reader.doc, scroll_mode) {
             let mut want: Vec<(usize, f32)> = Vec::new();
             let mut push = |p: Option<usize>, rect_h: f32, pdf: &PdfState| {
                 if let Some(p) = p {
                     let (w, h) = pdf.sizes[p];
-                    let mut s = rect_h * ppp / h;
+                    let ch = if settings.pdf_crop {
+                        pdf.crops.get(&p).map(|c| c.height()).unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    let mut s = rect_h * ppp / (h * ch);
                     s = s.min(5000.0 / w.max(h)).max(0.05);
                     if !want.iter().any(|(q, _)| *q == p) {
                         want.push((p, s));
@@ -1607,7 +2015,10 @@ impl App {
                     back_to_library = true;
                 }
             }
-            if input.key_pressed(Key::F) {
+            if input.modifiers.command && input.key_pressed(Key::F) {
+                reader.show_toc = true;
+                reader.panel_tab = 2;
+            } else if input.key_pressed(Key::F) {
                 let fs = input.viewport().fullscreen.unwrap_or(false);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
             }
@@ -1658,7 +2069,7 @@ impl App {
             }
         }
 
-        if !zoomed {
+        if !zoomed && !scroll_mode {
             // rueda / gesto de dos dedos
             if resp.hovered() && reader.turn.is_none() {
                 reader.scroll_acc += input.smooth_scroll_delta;
@@ -1677,8 +2088,82 @@ impl App {
                     }
                 }
             }
+            // ---- selección de texto (EPUB): arrastrar sobre el texto selecciona
+            let hit_at = |reader: &Reader, pos: Pos2, slack: bool| -> Option<TextPos> {
+                let Doc::Epub(ep) = &reader.doc else {
+                    return None;
+                };
+                let l = ep.layout.as_ref()?;
+                let s = sp.of(reader.page);
+                let gg = geo(s);
+                let (pl, pr) = sp.pages(s);
+                for (p, r) in [pl.zip(gg.left), pr.zip(gg.right)].into_iter().flatten() {
+                    if !r.expand(12.0).contains(pos) {
+                        continue;
+                    }
+                    let (mx, mt, _) = margins(r.size());
+                    return layout::hit(&l.pages[p], r.min + vec2(mx, mt), pos, slack);
+                }
+                None
+            };
+            let mut started_selection = false;
+            if resp.drag_started() && reader.turn.is_none() {
+                if let Some(ptr) = resp.interact_pointer_pos() {
+                    if let Some(h) = hit_at(reader, ptr, false) {
+                        reader.sel = Some((h, h));
+                        reader.selecting = true;
+                        reader.popup = None;
+                        started_selection = true;
+                    }
+                }
+            }
+            if reader.selecting {
+                if let (Some(ptr), Some((a, _))) = (pointer, reader.sel) {
+                    if let Some(h) = hit_at(reader, ptr, true) {
+                        if h.0 == a.0 {
+                            reader.sel = Some((a, h));
+                        }
+                    }
+                }
+                if !resp.dragged() {
+                    reader.selecting = false;
+                    match reader.sel {
+                        Some((a, b)) if a != b => {
+                            let (a, b) = match &reader.doc {
+                                Doc::Epub(ep) => layout::snap_words(&ep.epub, a, b),
+                                _ => (a, b),
+                            };
+                            reader.sel = Some((a, b));
+                            let p = pointer.unwrap_or(full.center());
+                            reader.popup = Some(Popup {
+                                pos: p,
+                                kind: PopupKind::New(a.min(b), a.max(b)),
+                            });
+                        }
+                        _ => reader.sel = None,
+                    }
+                }
+            }
+            let mut click_consumed = false;
+            if resp.clicked() && reader.turn.is_none() {
+                if reader.popup.is_some() || reader.sel.is_some() {
+                    reader.popup = None;
+                    reader.sel = None;
+                    click_consumed = true;
+                } else if let Some(ptr) = resp.interact_pointer_pos() {
+                    if let Some(h) = hit_at(reader, ptr, false) {
+                        if let Some(i) = notes.iter().position(|n| n.from() <= h && h < n.to()) {
+                            reader.popup = Some(Popup {
+                                pos: ptr,
+                                kind: PopupKind::Existing(i),
+                            });
+                            click_consumed = true;
+                        }
+                    }
+                }
+            }
             // arrastrar la esquina
-            if resp.drag_started() {
+            if resp.drag_started() && !started_selection && !reader.selecting {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     finish(reader);
                     let s = sp.of(reader.page);
@@ -1731,7 +2216,7 @@ impl App {
                     }
                 }
             }
-            if resp.clicked() && reader.turn.is_none() {
+            if resp.clicked() && reader.turn.is_none() && !click_consumed {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     let near_edge = ptr.y < full.top() + 80.0 || ptr.y > full.bottom() - 80.0;
                     if !near_edge {
@@ -1748,6 +2233,69 @@ impl App {
                     }
                 }
             }
+        }
+
+        // ---- lectura en voz alta continua
+        if reader.tts_on {
+            let finished = match reader.tts.as_mut() {
+                Some(c) => c.try_wait().ok().flatten().is_some(),
+                None => true,
+            };
+            if finished && reader.turn.is_none() {
+                let s = sp.of(reader.page);
+                let first = sp.first(s);
+                if reader.tts_page == Some(first) {
+                    if s + 1 < sp.count() {
+                        start_turn(reader, true);
+                    } else {
+                        reader.tts_on = false;
+                    }
+                } else {
+                    let (pl, pr) = sp.pages(s);
+                    let lang;
+                    let text: Option<String> = match &reader.doc {
+                        Doc::Epub(ep) => {
+                            lang = ep.epub.language.clone();
+                            ep.layout.as_ref().map(|l| {
+                                [pl, pr]
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|p| layout::page_text(&l.pages[p]))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                        }
+                        Doc::Pdf(_) => {
+                            lang = "es".into();
+                            let path = self.saved.library[reader.entry].path.clone();
+                            let pt = reader
+                                .pdf_text
+                                .get_or_insert_with(|| start_pdf_text(path, ctx.clone()))
+                                .clone();
+                            let g = pt.lock().ok();
+                            g.as_ref().and_then(|g| g.as_ref()).map(|pages| {
+                                [pl, pr]
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|p| pages.get(p).cloned())
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                        }
+                    };
+                    if let Some(t) = text {
+                        reader.tts = tools::speak(&t, &lang, settings.tts_rate);
+                        reader.tts_page = Some(first);
+                        if reader.tts.is_none() && t.trim().is_empty() {
+                            // página sin texto: pasa a la siguiente
+                        } else if reader.tts.is_none() {
+                            reader.tts_on = false;
+                            self.message = Some(("No se pudo usar la voz del sistema".into(), 0.0));
+                        }
+                    }
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
 
         // ---- animación
@@ -1799,6 +2347,7 @@ impl App {
                     Some((t, ra.zip(ga.right), lb.zip(gb.left), ga)),
                 )
             }
+            None if scroll_mode => (None, None, None),
             None => {
                 let (l, r) = sp.pages(cur_spread);
                 (l.zip(g.left), r.zip(g.right), None)
@@ -1843,6 +2392,7 @@ impl App {
         // mallas de una página
         let title = reader.title.clone();
         let theme_idx = settings.theme;
+        let search_hit = reader.search_hit;
         let page_meshes = |reader: &mut Reader, page: usize, rect: Rect, side: Side| -> Vec<Mesh> {
             let mut out = Vec::new();
             match &mut reader.doc {
@@ -1863,11 +2413,19 @@ impl App {
                         24,
                     ));
                     if let Some((t, _)) = pdf.tex.get(&page) {
+                        let uv = if settings.pdf_crop {
+                            pdf.crops
+                                .get(&page)
+                                .copied()
+                                .unwrap_or(Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)))
+                        } else {
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))
+                        };
                         out.push(book::strip(
                             rect,
                             side,
                             t.id(),
-                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            uv,
                             tint,
                             th.night,
                             true,
@@ -1925,12 +2483,54 @@ impl App {
                         vec2(l.params.width, l.params.height),
                     );
                     let mut shapes: Vec<(Rect, Shape)> = Vec::new();
+                    for n in &notes {
+                        if n.chapter != pg.chapter {
+                            continue;
+                        }
+                        for r in layout::range_rects(pg, text.min, n.from(), n.to()) {
+                            shapes.push((
+                                rect,
+                                Shape::rect_filled(r, 2.0, note_fill(n.color, th.night)),
+                            ));
+                            if !n.note.is_empty() {
+                                shapes.push((
+                                    rect,
+                                    Shape::line_segment(
+                                        [r.left_bottom(), r.right_bottom()],
+                                        egui::Stroke::new(1.5, th.faint),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some((a, b)) = search_hit {
+                        for r in layout::range_rects(pg, text.min, a, b) {
+                            shapes.push((
+                                rect,
+                                Shape::rect_filled(
+                                    r,
+                                    2.0,
+                                    Color32::from_rgba_unmultiplied(255, 140, 0, 120),
+                                ),
+                            ));
+                        }
+                    }
                     for it in &pg.items {
                         match it {
+                            Item::Bullet { galley, offset } => {
+                                let ts = egui::epaint::TextShape::new(
+                                    text.min + *offset,
+                                    galley.clone(),
+                                    th.ink,
+                                )
+                                .with_override_text_color(th.ink);
+                                shapes.push((rect, Shape::Text(ts)));
+                            }
                             Item::Text {
                                 galley,
                                 offset,
                                 clip,
+                                ..
                             } => {
                                 let clip_r = Rect::from_x_y_ranges(
                                     rect.x_range(),
@@ -2082,6 +2682,21 @@ impl App {
                 book::ribbon(&painter, r);
             }
         }
+        // selección en curso
+        if let (Some((a, b)), None, Doc::Epub(ep)) = (reader.sel, reader.turn, &reader.doc) {
+            if let Some(l) = &ep.layout {
+                for (p, r) in [statics_l, statics_r].into_iter().flatten() {
+                    let (mx, mt, _) = margins(r.size());
+                    for rr in layout::range_rects(&l.pages[p], r.min + vec2(mx, mt), a, b) {
+                        painter.rect_filled(
+                            rr,
+                            2.0,
+                            Color32::from_rgba_unmultiplied(60, 130, 230, 70),
+                        );
+                    }
+                }
+            }
+        }
         if let Some((t, front, backp, ga)) = sheet {
             let w_front = front
                 .map(|f| f.1.width())
@@ -2209,7 +2824,7 @@ impl App {
                                 if ui.button("‹ Biblioteca").clicked() {
                                     back_to_library = true;
                                 }
-                                if ui.selectable_label(open_toc, "Índice").clicked() {
+                                if ui.selectable_label(open_toc, "Índice y notas").clicked() {
                                     open_toc = !open_toc;
                                 }
                                 ui.with_layout(
@@ -2249,6 +2864,38 @@ impl App {
                                             .clicked()
                                         {
                                             open_settings = !open_settings;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                reader.tts_on,
+                                                if reader.tts_on {
+                                                    "Parar lectura"
+                                                } else {
+                                                    "Leer en voz alta"
+                                                },
+                                            )
+                                            .clicked()
+                                        {
+                                            if reader.tts_on {
+                                                reader.tts_on = false;
+                                                if let Some(mut c) = reader.tts.take() {
+                                                    let _ = c.kill();
+                                                }
+                                            } else {
+                                                if let Some(mut c) = reader.tts.take() {
+                                                    let _ = c.kill();
+                                                }
+                                                reader.tts_on = true;
+                                                reader.tts_page = None;
+                                            }
+                                        }
+                                        if ui
+                                            .button("Buscar")
+                                            .on_hover_text("Buscar en el libro (⌘F)")
+                                            .clicked()
+                                        {
+                                            open_toc = true;
+                                            reader.panel_tab = 2;
                                         }
                                         if ui
                                             .button("Marcar")
@@ -2353,76 +3000,357 @@ impl App {
                 });
         }
 
-        // ---- índice
+        // ---- menú de selección / subrayado
+        if let Some(pp) = reader.popup.clone() {
+            let lang = match &reader.doc {
+                Doc::Epub(ep) => ep.epub.language.clone(),
+                _ => "es".into(),
+            };
+            let (text, cur_color) = match &pp.kind {
+                PopupKind::New(a, b) => match &reader.doc {
+                    Doc::Epub(ep) => (layout::range_text(&ep.epub, *a, *b), None),
+                    _ => (String::new(), None),
+                },
+                PopupKind::Existing(i) => notes
+                    .get(*i)
+                    .map(|n| (n.text.clone(), Some(n.color)))
+                    .unwrap_or_default(),
+            };
+            let pos = pos2(
+                (pp.pos.x - 170.0).clamp(full.left() + 8.0, full.right() - 360.0),
+                (pp.pos.y + 14.0).min(full.bottom() - 120.0),
+            );
+            egui::Area::new(egui::Id::NULL.with("menu_sel"))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (ci, (r, g, b)) in NOTE_COLORS.iter().enumerate() {
+                                    let (rect, rr) =
+                                        ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                                    ui.painter().circle_filled(
+                                        rect.center(),
+                                        10.0,
+                                        Color32::from_rgb(*r, *g, *b),
+                                    );
+                                    if cur_color == Some(ci as u8) {
+                                        ui.painter().circle_stroke(
+                                            rect.center(),
+                                            12.0,
+                                            egui::Stroke::new(2.0, txt),
+                                        );
+                                    }
+                                    if rr.on_hover_text("Subrayar").clicked() {
+                                        note_ops.push(match &pp.kind {
+                                            PopupKind::New(a, b) => {
+                                                NoteOp::Add(*a, *b, ci as u8, text.clone(), false)
+                                            }
+                                            PopupKind::Existing(i) => NoteOp::Color(*i, ci as u8),
+                                        });
+                                    }
+                                }
+                                ui.separator();
+                                match &pp.kind {
+                                    PopupKind::New(a, b) => {
+                                        if ui.button("Nota").clicked() {
+                                            note_ops.push(NoteOp::Add(
+                                                *a,
+                                                *b,
+                                                0,
+                                                text.clone(),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                    PopupKind::Existing(i) => {
+                                        if ui.button("Nota").clicked() {
+                                            note_ops.push(NoteOp::Edit(*i));
+                                        }
+                                        if ui.button("Borrar").clicked() {
+                                            note_ops.push(NoteOp::Delete(*i));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.button("Copiar").clicked() {
+                                    ctx.copy_text(text.clone());
+                                    note_ops.push(NoteOp::Close);
+                                }
+                                let first_word: String =
+                                    text.split_whitespace().next().unwrap_or("").to_string();
+                                if ui.button("Diccionario").clicked() {
+                                    tools::dictionary(&first_word);
+                                    note_ops.push(NoteOp::Close);
+                                }
+                                if ui
+                                    .button("RAE")
+                                    .on_hover_text("Diccionario de la lengua española")
+                                    .clicked()
+                                {
+                                    tools::rae(&first_word);
+                                    note_ops.push(NoteOp::Close);
+                                }
+                                if ui.button("Traducir").clicked() {
+                                    tools::translate(&text);
+                                    note_ops.push(NoteOp::Close);
+                                }
+                                if ui
+                                    .button("Leer")
+                                    .on_hover_text("Leer en voz alta")
+                                    .clicked()
+                                {
+                                    if let Some(mut c) = reader.tts.take() {
+                                        let _ = c.kill();
+                                    }
+                                    reader.tts_on = false;
+                                    reader.tts = tools::speak(&text, &lang, settings.tts_rate);
+                                    note_ops.push(NoteOp::Close);
+                                }
+                            });
+                        });
+                });
+        }
+
+        // ---- editor de notas
+        let mut close_editor = false;
+        if let Some(ed) = reader.note_edit.as_mut() {
+            egui::Window::new("Nota")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(&ctx, |ui| {
+                    if let Some(i) = ed.idx {
+                        if let Some(n) = notes.get(i) {
+                            if !n.text.is_empty() {
+                                let mut q: String = n.text.chars().take(300).collect();
+                                if n.text.chars().count() > 300 {
+                                    q.push('…');
+                                }
+                                ui.label(egui::RichText::new(format!("«{q}»")).italics());
+                                ui.add_space(6.0);
+                            }
+                        }
+                    } else {
+                        ui.label(format!("Nota de la página {}", ed.page + 1));
+                    }
+                    ui.add(
+                        egui::TextEdit::multiline(&mut ed.text)
+                            .desired_width(420.0)
+                            .desired_rows(6)
+                            .hint_text("Escribe tu nota…"),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Guardar").clicked() {
+                            note_ops.push(NoteOp::SetText(ed.idx, ed.page, ed.text.clone()));
+                            close_editor = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            close_editor = true;
+                        }
+                    });
+                });
+        }
+        if close_editor {
+            reader.note_edit = None;
+        }
+
+        // ---- panel lateral: índice, notas y búsqueda
         if open_toc {
             egui::Area::new(egui::Id::NULL.with("indice"))
                 .fixed_pos(full.left_top() + vec2(0.0, 48.0))
                 .order(egui::Order::Foreground)
                 .show(&ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(bar_fill)
-                        .inner_margin(egui::Margin::same(14))
-                        .show(ui, |ui| {
-                            ui.set_width(280.0);
-                            ui.set_height(full.height() - 110.0);
-                            ui.visuals_mut().override_text_color = Some(txt);
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                if let Doc::Epub(ep) = &reader.doc {
-                                    ui.heading("Índice");
-                                    ui.add_space(6.0);
-                                    let cur = sp.first(sp.of(reader.page));
-                                    for t in &ep.epub.toc {
-                                        let p = ep
-                                            .layout
-                                            .as_ref()
-                                            .map(|l| l.page_of(t.chapter, t.block))
-                                            .unwrap_or(0);
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(t.level as f32 * 14.0);
-                                            let sel = cur >= p
-                                                && ep.layout.as_ref().is_some_and(|l| {
-                                                    l.pages[cur].chapter == t.chapter
+                    let panel_fill = if th.night { Color32::from_rgb(24, 24, 26) } else { Color32::from_rgb(248, 247, 244) };
+                    egui::Frame::new().fill(panel_fill).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+                        ui.set_width(320.0);
+                        ui.set_height(full.height() - 110.0);
+                        ui.visuals_mut().override_text_color = Some(txt);
+                        ui.horizontal(|ui| {
+                            for (i, n) in ["Índice", "Notas", "Buscar"].iter().enumerate() {
+                                if ui.selectable_label(reader.panel_tab == i as u8, *n).clicked() {
+                                    reader.panel_tab = i as u8;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        match reader.panel_tab {
+                            // ---------- Índice
+                            0 => {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    match &reader.doc {
+                                        Doc::Epub(ep) => {
+                                            let cur = sp.first(sp.of(reader.page));
+                                            for t in &ep.epub.toc {
+                                                let p = ep.layout.as_ref().map(|l| l.page_of(t.chapter, t.block)).unwrap_or(0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(t.level as f32 * 14.0);
+                                                    let sel = cur >= p
+                                                        && ep.layout.as_ref().is_some_and(|l| l.pages[cur].chapter == t.chapter);
+                                                    if ui.selectable_label(sel, &t.title).clicked() {
+                                                        jump_anchor = Some((t.chapter, t.block));
+                                                    }
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.weak(format!("{}", p + 1));
+                                                    });
                                                 });
-                                            if ui.selectable_label(sel, &t.title).clicked() {
-                                                jump_anchor = Some((t.chapter, t.block));
                                             }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.weak(format!("{}", p + 1));
-                                                },
-                                            );
-                                        });
-                                    }
-                                    if ep.epub.toc.is_empty() {
-                                        ui.weak("Este libro no incluye índice.");
+                                            if ep.epub.toc.is_empty() {
+                                                ui.weak("Este libro no incluye índice.");
+                                            }
+                                        }
+                                        Doc::Pdf(pdf) => {
+                                            let outline = pdf.outline.lock().ok().and_then(|o| o.clone());
+                                            match outline {
+                                                None => {
+                                                    ui.weak("Leyendo el índice del PDF…");
+                                                }
+                                                Some(v) if v.is_empty() => {
+                                                    ui.weak("Este PDF no incluye índice.");
+                                                }
+                                                Some(v) => {
+                                                    for (t, lvl, p) in v {
+                                                        ui.horizontal(|ui| {
+                                                            ui.add_space(lvl as f32 * 14.0);
+                                                            if ui.selectable_label(reader.page == p, &t).clicked() {
+                                                                jump = Some(p);
+                                                            }
+                                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                                ui.weak(format!("{}", p + 1));
+                                                            });
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     ui.add_space(14.0);
-                                }
-                                ui.heading("Marcadores");
-                                ui.add_space(6.0);
-                                if bookmarks.is_empty() {
-                                    ui.weak("Pulsa «Marcar» o la tecla B para marcar la página.");
-                                }
-                                for b in &bookmarks {
-                                    let (label, target) = match &reader.doc {
-                                        Doc::Pdf(_) => (format!("Página {}", b.0 + 1), b.0),
-                                        Doc::Epub(ep) => {
-                                            let p = l_page(ep, *b).unwrap_or(0);
-                                            let ch = ep
-                                                .epub
-                                                .chapter_title(b.0)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            (format!("Pág. {} — {}", p + 1, ch), p)
-                                        }
-                                    };
-                                    if ui.selectable_label(false, label).clicked() {
-                                        jump = Some(target);
+                                    ui.heading("Marcadores");
+                                    ui.add_space(6.0);
+                                    if bookmarks.is_empty() {
+                                        ui.weak("Pulsa «Marcar» o la tecla B para marcar la página.");
                                     }
+                                    for b in &bookmarks {
+                                        let (label, target) = match &reader.doc {
+                                            Doc::Pdf(_) => (format!("Página {}", b.0 + 1), b.0),
+                                            Doc::Epub(ep) => {
+                                                let p = l_page(ep, *b).unwrap_or(0);
+                                                let ch = ep.epub.chapter_title(b.0).unwrap_or("").to_string();
+                                                (format!("Pág. {} — {}", p + 1, ch), p)
+                                            }
+                                        };
+                                        if ui.selectable_label(false, label).clicked() {
+                                            jump = Some(target);
+                                        }
+                                    }
+                                });
+                            }
+                            // ---------- Notas
+                            1 => {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} notas y subrayados", notes.len()));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if !notes.is_empty() && ui.button("Exportar…").clicked() {
+                                            note_ops.push(NoteOp::Export);
+                                        }
+                                        if matches!(reader.doc, Doc::Pdf(_)) && ui.button("+ Nota").clicked() {
+                                            reader.note_edit = Some(NoteEdit { idx: None, page: reader.page, text: String::new() });
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                if notes.is_empty() {
+                                    ui.weak(if matches!(reader.doc, Doc::Pdf(_)) {
+                                        "Añade notas a cualquier página con «+ Nota»."
+                                    } else {
+                                        "Arrastra sobre el texto para seleccionarlo y elige un color o «Nota»."
+                                    });
                                 }
-                            });
-                        });
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for (i, n) in notes.iter().enumerate() {
+                                        let page = match &reader.doc {
+                                            Doc::Epub(ep) => ep.layout.as_ref().map(|l| l.page_of_char(n.chapter, n.block, n.start)).unwrap_or(0),
+                                            Doc::Pdf(_) => n.chapter,
+                                        };
+                                        let (r, g, b) = NOTE_COLORS[n.color as usize % 4];
+                                        egui::Frame::new()
+                                            .inner_margin(egui::Margin::same(6))
+                                            .stroke(egui::Stroke::new(1.0, Color32::from_gray(if th.night { 60 } else { 210 })))
+                                            .corner_radius(6.0)
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    let (rect, _) = ui.allocate_exact_size(vec2(4.0, 16.0), Sense::hover());
+                                                    ui.painter().rect_filled(rect, 1.0, Color32::from_rgb(r, g, b));
+                                                    ui.weak(format!("Pág. {}", page + 1));
+                                                });
+                                                if !n.text.is_empty() {
+                                                    let mut q: String = n.text.chars().take(220).collect();
+                                                    if n.text.chars().count() > 220 {
+                                                        q.push('…');
+                                                    }
+                                                    ui.label(egui::RichText::new(q).italics());
+                                                }
+                                                if !n.note.is_empty() {
+                                                    ui.label(egui::RichText::new(&n.note).strong());
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    if ui.small_button("Ir").clicked() {
+                                                        jump = Some(page);
+                                                    }
+                                                    if ui.small_button("Editar nota").clicked() {
+                                                        note_ops.push(NoteOp::Edit(i));
+                                                    }
+                                                    if ui.small_button("Borrar").clicked() {
+                                                        note_ops.push(NoteOp::Delete(i));
+                                                    }
+                                                });
+                                            });
+                                        ui.add_space(4.0);
+                                    }
+                                });
+                            }
+                            // ---------- Buscar
+                            _ => {
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut reader.search_q)
+                                        .hint_text("Buscar en este libro")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                if reader.panel_tab == 2 && reader.search_results.is_empty() && reader.search_q.is_empty() {
+                                    r.request_focus();
+                                }
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) || ui.button("Buscar").clicked() {
+                                    do_search = true;
+                                }
+                                if reader.search_pending {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.weak("Leyendo el texto del PDF…");
+                                    });
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                                } else if !reader.search_q.is_empty() {
+                                    ui.weak(format!("{} resultados", reader.search_results.len()));
+                                }
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for hit in reader.search_results.clone() {
+                                        let label = egui::RichText::new(format!("Pág. {}  ·  {}", hit.page + 1, hit.context));
+                                        if ui.add(egui::Button::new(label).wrap().frame_when_inactive(false)).clicked() {
+                                            jump = Some(hit.page);
+                                            if matches!(reader.doc, Doc::Epub(_)) {
+                                                let end = (hit.pos.0, hit.pos.1, hit.pos.2 + hit.len);
+                                                reader.search_hit = Some((hit.pos, end));
+                                                note_ops.push(NoteOp::Refresh);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
                 });
         }
 
@@ -2484,6 +3412,11 @@ impl App {
                                     ui.selectable_value(&mut s.sans, true, "Sans");
                                     ui.checkbox(&mut s.justify, "Justificar");
                                 });
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut s.hyphenate, "Partir palabras (guiones)");
+                                    ui.checkbox(&mut s.publisher, "Estilo del editor")
+                                        .on_hover_text("Respeta alineaciones, sangrías y tamaños definidos por el propio libro");
+                                });
                                 ui.add(
                                     egui::Slider::new(&mut s.font_size, 12.0..=40.0)
                                         .text("Tamaño")
@@ -2509,12 +3442,163 @@ impl App {
                                 "Portada sola (como un libro o revista)",
                             );
                             ui.checkbox(&mut s.animate, "Animación al pasar página");
+                            if is_pdf {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("PDF").strong());
+                                ui.checkbox(&mut s.pdf_crop, "Recortar márgenes blancos");
+                                ui.checkbox(&mut s.pdf_scroll, "Desplazamiento continuo (sin pasar página)");
+                            }
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Lectura en voz alta").strong());
+                            ui.add(egui::Slider::new(&mut s.tts_rate, 120..=320).text("Velocidad"));
                         });
                 });
         }
 
         reader.show_settings = open_settings;
         reader.show_toc = open_toc;
+
+        // ---- búsqueda
+        if do_search
+            || (reader.search_pending
+                && reader
+                    .pdf_text
+                    .as_ref()
+                    .is_some_and(|t| t.lock().is_ok_and(|g| g.is_some())))
+        {
+            let q = reader.search_q.trim().to_string();
+            reader.search_results.clear();
+            reader.search_hit = None;
+            if !q.is_empty() {
+                match &reader.doc {
+                    Doc::Epub(ep) => {
+                        reader.search_results = search_epub(ep, &q);
+                    }
+                    Doc::Pdf(_) => {
+                        let path = self.saved.library[reader.entry].path.clone();
+                        let pt = reader
+                            .pdf_text
+                            .get_or_insert_with(|| start_pdf_text(path, ctx.clone()))
+                            .clone();
+                        let guard = pt.lock().ok();
+                        match guard.as_ref().and_then(|g| g.as_ref()) {
+                            Some(pages) => {
+                                reader.search_results = search_pages(pages, &q);
+                                reader.search_pending = false;
+                            }
+                            None => reader.search_pending = true,
+                        }
+                    }
+                }
+            }
+            if let Doc::Epub(ep) = &mut reader.doc {
+                ep.cache.clear();
+            }
+        }
+
+        // ---- operaciones sobre notas
+        if !note_ops.is_empty() {
+            let entry = &mut self.saved.library[reader.entry];
+            for op in note_ops.drain(..) {
+                match op {
+                    NoteOp::Add(a, b, color, text, edit) => {
+                        let (a, b) = (a.min(b), a.max(b));
+                        entry.notes.push(Note {
+                            chapter: a.0,
+                            block: a.1,
+                            start: a.2,
+                            end_block: b.1,
+                            end: b.2,
+                            color,
+                            text,
+                            note: String::new(),
+                            created: now(),
+                        });
+                        entry.notes.sort_by_key(|n| (n.chapter, n.block, n.start));
+                        let idx = entry
+                            .notes
+                            .iter()
+                            .position(|n| n.from() == a && n.to() == b);
+                        reader.sel = None;
+                        reader.popup = None;
+                        if edit {
+                            reader.note_edit = Some(NoteEdit {
+                                idx,
+                                page: reader.page,
+                                text: String::new(),
+                            });
+                        }
+                    }
+                    NoteOp::Color(i, c) => {
+                        if let Some(n) = entry.notes.get_mut(i) {
+                            n.color = c;
+                        }
+                        reader.popup = None;
+                    }
+                    NoteOp::Edit(i) => {
+                        let text = entry
+                            .notes
+                            .get(i)
+                            .map(|n| n.note.clone())
+                            .unwrap_or_default();
+                        reader.note_edit = Some(NoteEdit {
+                            idx: Some(i),
+                            page: reader.page,
+                            text,
+                        });
+                        reader.popup = None;
+                    }
+                    NoteOp::Delete(i) => {
+                        if i < entry.notes.len() {
+                            entry.notes.remove(i);
+                        }
+                        reader.popup = None;
+                    }
+                    NoteOp::SetText(idx, page, text) => match idx {
+                        Some(i) => {
+                            if let Some(n) = entry.notes.get_mut(i) {
+                                n.note = text;
+                            }
+                        }
+                        None => {
+                            if !text.trim().is_empty() {
+                                entry.notes.push(Note {
+                                    chapter: page,
+                                    note: text,
+                                    created: now(),
+                                    ..Default::default()
+                                });
+                                entry.notes.sort_by_key(|n| (n.chapter, n.block, n.start));
+                            }
+                        }
+                    },
+                    NoteOp::Close => {
+                        reader.popup = None;
+                        reader.sel = None;
+                    }
+                    NoteOp::Refresh => {}
+                    NoteOp::Export => {
+                        let md = export_notes(entry, &reader.doc);
+                        let name = format!("{} - notas.md", entry.title.replace(['/', ':'], "-"));
+                        if let Some(f) = rfd::FileDialog::new()
+                            .set_file_name(&name)
+                            .add_filter("Markdown", &["md"])
+                            .save_file()
+                        {
+                            match std::fs::write(&f, md) {
+                                Ok(()) => self.message = Some(("Notas exportadas".into(), 0.0)),
+                                Err(e) => {
+                                    self.message = Some((format!("No se pudo guardar: {e}"), 0.0))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Doc::Epub(ep) = &mut reader.doc {
+                ep.cache.clear();
+            }
+        }
 
         if let Some(a) = jump_anchor {
             if let Doc::Epub(ep) = &reader.doc {
@@ -2559,6 +3643,53 @@ impl App {
 }
 
 impl App {
+    fn meta_editor_ui(&mut self, ctx: &egui::Context) {
+        let Some((idx, title, author, subjects)) = self.meta_editor.as_mut() else {
+            return;
+        };
+        let mut save = false;
+        let mut close = false;
+        egui::Window::new("Datos del libro")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label("Título");
+                ui.add(egui::TextEdit::singleline(title).desired_width(f32::INFINITY));
+                ui.label("Autor");
+                ui.add(egui::TextEdit::singleline(author).desired_width(f32::INFINITY));
+                ui.label("Temas (separados por comas)");
+                ui.add(egui::TextEdit::singleline(subjects).desired_width(f32::INFINITY));
+                ui.weak("Los cambios se guardan en la biblioteca, no en el archivo.");
+                ui.horizontal(|ui| {
+                    if ui.button("Guardar").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if save {
+            if let Some(e) = self.saved.library.get_mut(*idx) {
+                e.title = title.trim().to_string();
+                e.author = author.trim().to_string();
+                e.subjects = subjects
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                e.meta_v = 2;
+                e.meta_done = true;
+            }
+            close = true;
+        }
+        if close {
+            self.meta_editor = None;
+        }
+    }
+
     fn cover_editor_ui(&mut self, ctx: &egui::Context) {
         let Some(ed) = self.cover_editor.as_mut() else {
             return;
@@ -2754,6 +3885,396 @@ fn sort_key(s: &str) -> String {
         }
     }
     t.to_string()
+}
+
+enum NoteOp {
+    Add(TextPos, TextPos, u8, String, bool),
+    Color(usize, u8),
+    Edit(usize),
+    Delete(usize),
+    SetText(Option<usize>, usize, String),
+    Close,
+    Refresh,
+    Export,
+}
+
+/// Minúsculas sin acentos, carácter a carácter (conserva los índices).
+fn fold(c: char) -> char {
+    match c {
+        'á' | 'à' | 'ä' | 'â' | 'Á' | 'À' | 'Ä' | 'Â' => 'a',
+        'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
+        'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
+        'ó' | 'ò' | 'ö' | 'ô' | 'Ó' | 'Ò' | 'Ö' | 'Ô' => 'o',
+        'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
+        'ñ' | 'Ñ' => 'n',
+        'ç' | 'Ç' => 'c',
+        '\u{a0}' | '\n' => ' ',
+        c => c.to_lowercase().next().unwrap_or(c),
+    }
+}
+
+fn find_all(hay: &[char], needle: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            out.push(i);
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn context(chars: &[char], at: usize, len: usize) -> String {
+    let a = at.saturating_sub(40);
+    let b = (at + len + 60).min(chars.len());
+    let mut s: String = chars[a..b].iter().collect::<String>().replace('\n', " ");
+    if a > 0 {
+        s = format!("…{s}");
+    }
+    if b < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+fn search_epub(ep: &EpubState, q: &str) -> Vec<SearchHit> {
+    let needle: Vec<char> = q.chars().map(fold).collect();
+    let mut out = Vec::new();
+    for (ci, ch) in ep.epub.chapters.iter().enumerate() {
+        for (bi, b) in ch.blocks.iter().enumerate() {
+            let orig: Vec<char> = layout::block_text(b).chars().collect();
+            let folded: Vec<char> = orig.iter().map(|c| fold(*c)).collect();
+            for at in find_all(&folded, &needle) {
+                let page = ep
+                    .layout
+                    .as_ref()
+                    .map(|l| l.page_of_char(ci, bi, at))
+                    .unwrap_or(0);
+                out.push(SearchHit {
+                    pos: (ci, bi, at),
+                    len: needle.len(),
+                    page,
+                    context: context(&orig, at, needle.len()),
+                });
+                if out.len() >= 1000 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn search_pages(pages: &[String], q: &str) -> Vec<SearchHit> {
+    let needle: Vec<char> = q.chars().map(fold).collect();
+    let mut out = Vec::new();
+    for (pi, t) in pages.iter().enumerate() {
+        let orig: Vec<char> = t.chars().collect();
+        let folded: Vec<char> = orig.iter().map(|c| fold(*c)).collect();
+        for at in find_all(&folded, &needle) {
+            out.push(SearchHit {
+                pos: (pi, 0, at),
+                len: needle.len(),
+                page: pi,
+                context: context(&orig, at, needle.len()),
+            });
+            if out.len() >= 1000 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Extrae el texto de un PDF página a página en segundo plano.
+fn start_pdf_text(
+    path: String,
+    ctx: egui::Context,
+) -> std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s2 = slot.clone();
+    std::thread::spawn(move || {
+        let pages = std::fs::read(&path)
+            .ok()
+            .and_then(|d| {
+                std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem_by_pages(&d).ok())
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        if let Ok(mut g) = s2.lock() {
+            *g = Some(pages);
+        }
+        ctx.request_repaint();
+    });
+    slot
+}
+
+/// Índice (marcadores) del PDF en segundo plano.
+fn start_pdf_outline(
+    data: Vec<u8>,
+) -> std::sync::Arc<std::sync::Mutex<Option<Vec<(String, usize, usize)>>>> {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let s2 = slot.clone();
+    std::thread::spawn(move || {
+        let v = std::panic::catch_unwind(|| {
+            lopdf::Document::load_mem(&data)
+                .ok()
+                .and_then(|d| d.get_toc().ok())
+                .map(|t| {
+                    t.toc
+                        .into_iter()
+                        .map(|e| {
+                            (
+                                e.title.trim().to_string(),
+                                e.level.saturating_sub(1),
+                                e.page.saturating_sub(1),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+        if let Ok(mut g) = s2.lock() {
+            *g = Some(v);
+        }
+    });
+    slot
+}
+
+fn export_notes(entry: &Entry, doc: &Doc) -> String {
+    let mut s = format!("# {}\n", entry.title);
+    if !entry.author.is_empty() {
+        s.push_str(&format!("\n*{}*\n", entry.author));
+    }
+    let mut last_ch = usize::MAX;
+    for n in &entry.notes {
+        let (page, chapter_title) = match doc {
+            Doc::Epub(ep) => (
+                ep.layout
+                    .as_ref()
+                    .map(|l| l.page_of_char(n.chapter, n.block, n.start))
+                    .unwrap_or(0),
+                ep.epub.chapter_title(n.chapter).map(|s| s.to_string()),
+            ),
+            Doc::Pdf(_) => (n.chapter, None),
+        };
+        if let Some(t) = chapter_title {
+            if n.chapter != last_ch {
+                s.push_str(&format!("\n## {t}\n"));
+                last_ch = n.chapter;
+            }
+        }
+        s.push('\n');
+        if !n.text.is_empty() {
+            for l in n.text.lines() {
+                s.push_str(&format!("> {l}\n"));
+            }
+            s.push('\n');
+        }
+        if !n.note.is_empty() {
+            s.push_str(&format!("{}\n\n", n.note));
+        }
+        s.push_str(&format!("— pág. {}\n", page + 1));
+    }
+    s
+}
+
+/// Día local en formato AAAA-MM-DD.
+fn today_key(offset_days: i64) -> String {
+    (chrono::Local::now() - chrono::Duration::days(offset_days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+impl App {
+    /// Suma tiempo de lectura (máx. 3 min entre interacciones).
+    fn track_reading(&mut self, ctx: &egui::Context) {
+        let now_i = std::time::Instant::now();
+        let focused = ctx.input(|i| i.focused);
+        let active = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving());
+        if let Some(prev) = self.stat_tick {
+            let gap = now_i.duration_since(prev).as_secs_f32().min(180.0);
+            if focused && (active || self.reader.as_ref().is_some_and(|r| r.tts_on)) {
+                self.stat_acc += gap;
+            }
+        }
+        self.stat_tick = Some(now_i);
+        if self.stat_acc >= 1.0 {
+            let secs = self.stat_acc.floor();
+            self.stat_acc -= secs;
+            *self.saved.stats.entry(today_key(0)).or_default() += secs as u32;
+        }
+    }
+
+    fn today_minutes(&self) -> u32 {
+        self.saved.stats.get(&today_key(0)).copied().unwrap_or(0) / 60
+    }
+
+    fn streak(&self) -> u32 {
+        let mut n = 0;
+        let mut d = if self.saved.stats.get(&today_key(0)).copied().unwrap_or(0) >= 60 {
+            0
+        } else {
+            1
+        };
+        while self.saved.stats.get(&today_key(d)).copied().unwrap_or(0) >= 60 {
+            n += 1;
+            d += 1;
+        }
+        n
+    }
+
+    fn stats_ui(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(30, 30, 30);
+        let accent = Color32::from_rgb(130, 30, 30);
+        let goal = self.saved.settings.goal_min.max(1);
+        let today = self.today_minutes();
+        let big = |ui: &mut egui::Ui, v: String, label: &str| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(v)
+                        .font(FontId::new(40.0, FontFamily::Name("serif-b".into())))
+                        .color(ink),
+                );
+                ui.label(egui::RichText::new(label).color(Color32::GRAY));
+            });
+        };
+        let year = chrono::Local::now().format("%Y").to_string();
+        let year_secs: u32 = self
+            .saved
+            .stats
+            .iter()
+            .filter(|(k, _)| k.starts_with(&year))
+            .map(|(_, v)| *v)
+            .sum();
+        let year_start = chrono::NaiveDate::parse_from_str(&format!("{year}-01-01"), "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc().timestamp() as u64)
+            .unwrap_or(0);
+        let finished: Vec<(String, String)> = self
+            .saved
+            .library
+            .iter()
+            .filter(|e| e.finished_at >= year_start && e.is_finished())
+            .map(|e| (e.title.clone(), e.author_name().to_string()))
+            .collect();
+        let streak = self.streak();
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 60.0;
+                    big(ui, format!("{today} / {goal} min"), "Lectura de hoy");
+                    big(ui, format!("{streak}"), "Días seguidos leyendo");
+                    big(
+                        ui,
+                        format!("{:.1} h", year_secs as f32 / 3600.0),
+                        &format!("Leído en {year}"),
+                    );
+                    big(
+                        ui,
+                        format!("{}", finished.len()),
+                        &format!("Libros terminados en {year}"),
+                    );
+                });
+                ui.add_space(16.0);
+                // anillo de progreso del objetivo
+                let (r, _) = ui.allocate_exact_size(
+                    vec2(ui.available_width().min(700.0), 14.0),
+                    Sense::hover(),
+                );
+                ui.painter().rect_filled(r, 7.0, Color32::from_gray(225));
+                let f = (today as f32 / goal as f32).min(1.0);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(r.min, vec2(r.width() * f, r.height())),
+                    7.0,
+                    accent,
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Objetivo diario:");
+                    ui.add(
+                        egui::Slider::new(&mut self.saved.settings.goal_min, 5..=180)
+                            .suffix(" min"),
+                    );
+                });
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new("Últimos 30 días").strong().color(ink));
+                ui.add_space(6.0);
+                let w = ui.available_width().min(900.0);
+                let (rect, _) = ui.allocate_exact_size(vec2(w, 170.0), Sense::hover());
+                let p = ui.painter();
+                let days: Vec<(String, u32)> = (0..30)
+                    .rev()
+                    .map(|d| {
+                        (
+                            today_key(d),
+                            self.saved.stats.get(&today_key(d)).copied().unwrap_or(0) / 60,
+                        )
+                    })
+                    .collect();
+                let maxv = days.iter().map(|d| d.1).max().unwrap_or(0).max(goal).max(1) as f32;
+                let bw = w / 30.0;
+                let base = rect.bottom() - 20.0;
+                let gy = base - (goal as f32 / maxv) * 130.0;
+                p.line_segment(
+                    [pos2(rect.left(), gy), pos2(rect.right(), gy)],
+                    egui::Stroke::new(1.0, Color32::from_rgb(200, 150, 150)),
+                );
+                p.text(
+                    pos2(rect.right(), gy - 2.0),
+                    Align2::RIGHT_BOTTOM,
+                    "objetivo",
+                    FontId::proportional(11.0),
+                    Color32::from_rgb(180, 120, 120),
+                );
+                for (i, (k, v)) in days.iter().enumerate() {
+                    let hgt = (*v as f32 / maxv) * 130.0;
+                    let x = rect.left() + i as f32 * bw;
+                    let col = if *v >= goal {
+                        accent
+                    } else {
+                        Color32::from_rgb(190, 160, 150)
+                    };
+                    p.rect_filled(
+                        Rect::from_min_max(pos2(x + 3.0, base - hgt), pos2(x + bw - 3.0, base)),
+                        3.0,
+                        col,
+                    );
+                    if i % 5 == 4 || i == 29 {
+                        p.text(
+                            pos2(x + bw / 2.0, base + 4.0),
+                            Align2::CENTER_TOP,
+                            &k[8..],
+                            FontId::proportional(11.0),
+                            Color32::GRAY,
+                        );
+                    }
+                }
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(format!("Terminados en {year}"))
+                        .strong()
+                        .color(ink),
+                );
+                if finished.is_empty() {
+                    ui.weak("Todavía ninguno. ¡A por el primero!");
+                }
+                for (t, a) in &finished {
+                    ui.label(format!("• {t} — {a}"));
+                }
+            });
+    }
 }
 
 fn l_page(ep: &EpubState, b: (usize, usize)) -> Option<usize> {

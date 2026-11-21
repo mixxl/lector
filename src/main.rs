@@ -6,7 +6,10 @@ mod cover;
 mod covers;
 mod epub;
 mod layout;
+#[cfg(target_os = "macos")]
+mod macos;
 mod pdfdoc;
+mod tools;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use std::sync::Arc;
@@ -56,13 +59,29 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    let initial: Vec<String> = std::env::args().skip(1).collect();
-    eframe::run_native(
-        "Lector",
-        opts,
-        Box::new(move |cc| {
-            cc.egui_ctx.set_fonts(fonts());
-            Ok(Box::new(app::App::new(cc, initial)))
-        }),
-    )
+    let initial: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with("-psn"))
+        .collect();
+    let creator = move |cc: &eframe::CreationContext<'_>| -> Result<
+        Box<dyn eframe::App>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        cc.egui_ctx.set_fonts(fonts());
+        #[cfg(target_os = "macos")]
+        let _ = macos::CTX.set(cc.egui_ctx.clone());
+        Ok(Box::new(app::App::new(cc, initial)))
+    };
+    #[cfg(target_os = "macos")]
+    {
+        // Bucle propio para poder recibir los archivos abiertos desde Finder
+        let event_loop =
+            winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+        macos::install();
+        let mut app = eframe::create_native("Lector", opts, Box::new(creator), &event_loop);
+        event_loop.run_app(&mut app)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    eframe::run_native("Lector", opts, Box::new(creator))
 }
