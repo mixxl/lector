@@ -18,4 +18,11 @@ iconutil -c icns icon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf icon.iconset
 codesign --force --deep -s - "$APP"
 ditto -c -k --keepParent "$APP" Lector-macOS.zip
-echo "Listo: Lector-macOS.zip"
+# imagen de disco con acceso directo a Aplicaciones
+rm -rf dmg Lector.dmg
+mkdir dmg
+cp -R "$APP" dmg/
+ln -s /Applications dmg/Aplicaciones
+hdiutil create -volname "Lector" -srcfolder dmg -ov -format UDZO Lector.dmg
+rm -rf dmg
+echo "Listo: Lector-macOS.zip y Lector.dmg"

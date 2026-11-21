@@ -26,11 +26,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Lector-macOS
-          path: Lector-macOS.zip
+          path: |
+            Lector-macOS.zip
+            Lector.dmg
       - name: Publicar versión descargable
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
           name: Lector 0.1.${{ github.run_number }}
           make_latest: true
-          files: Lector-macOS.zip
+          files: |
+            Lector.dmg
+            Lector-macOS.zip
