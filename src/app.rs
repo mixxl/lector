@@ -34,6 +34,8 @@ pub struct Settings {
     pub pdf_crop: bool,
     pub pdf_scroll: bool,
     pub goal_min: u32,
+    /// PDF a pantalla completa: ajustar al ancho y recortar márgenes
+    pub pdf_fill: bool,
 }
 
 impl Default for Settings {
@@ -54,6 +56,7 @@ impl Default for Settings {
             pdf_crop: false,
             pdf_scroll: false,
             goal_min: 20,
+            pdf_fill: true,
         }
     }
 }
@@ -274,6 +277,7 @@ struct Reader {
     /// desplazamiento vertical en modo continuo (PDF)
     scroll_y: f32,
     scroll_page: Option<usize>,
+    fill_spread: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -518,6 +522,7 @@ impl App {
             tts_page: None,
             scroll_y: 0.0,
             scroll_page: None,
+            fill_spread: None,
         });
     }
 
@@ -1565,6 +1570,8 @@ impl App {
         // ---- área útil y modo de página
         let area = full.shrink2(vec2(14.0, 16.0));
         let scroll_mode = settings.pdf_scroll && matches!(reader.doc, Doc::Pdf(_));
+        let fill = settings.pdf_fill && !scroll_mode && matches!(reader.doc, Doc::Pdf(_));
+        let crop_on = settings.pdf_crop || fill;
         let double = !scroll_mode
             && match settings.page_mode {
                 1 => false,
@@ -1678,14 +1685,16 @@ impl App {
             Vec2::ZERO
         };
         let pdf_crops: HashMap<usize, Rect> = match &reader.doc {
-            Doc::Pdf(p) if settings.pdf_crop => p.crops.clone(),
+            Doc::Pdf(p) if crop_on => p.crops.clone(),
             _ => HashMap::new(),
         };
         let pdf_sizes: Option<Vec<(f32, f32)>> = match &reader.doc {
             Doc::Pdf(p) => Some(p.sizes.clone()),
             _ => None,
         };
+        let pan_cell = std::cell::Cell::new(pan);
         let geo = |s: usize| -> Geo {
+            let pan = pan_cell.get();
             let (l, r) = sp.pages(s);
             let size_of = |p: usize| -> Vec2 {
                 match &pdf_sizes {
@@ -1707,6 +1716,32 @@ impl App {
             };
             let (al, ar) = (asp(sl, sr), asp(sr, sl));
             let c = area.center() + pan;
+            if fill {
+                // de borde a borde: ajusta al ancho de la ventana
+                let w_avail = full.width();
+                let cy = full.center().y + pan.y;
+                let cx = full.center().x + pan.x;
+                return if double {
+                    let h = (w_avail / 2.0 / al.max(ar)) * zoom;
+                    let top = cy - h / 2.0;
+                    Geo {
+                        spine: cx,
+                        left: l
+                            .map(|_| Rect::from_min_size(pos2(cx - al * h, top), vec2(al * h, h))),
+                        right: r.map(|_| Rect::from_min_size(pos2(cx, top), vec2(ar * h, h))),
+                    }
+                } else {
+                    let h = (w_avail / ar) * zoom;
+                    let w = ar * h;
+                    Geo {
+                        spine: cx - w / 2.0,
+                        left: None,
+                        right: r.map(|_| {
+                            Rect::from_min_size(pos2(cx - w / 2.0, cy - h / 2.0), vec2(w, h))
+                        }),
+                    }
+                };
+            }
             if double {
                 let h = area.height().min(area.width() / 2.0 / al.max(ar)) * zoom;
                 let spine = c.x;
@@ -1728,7 +1763,36 @@ impl App {
                 }
             }
         };
-        let g = geo(cur_spread);
+        let mut g = geo(cur_spread);
+        // ---- PDF a pantalla completa: desplazamiento vertical dentro del pliego
+        let overflow = if fill {
+            g.left
+                .or(g.right)
+                .map(|r| (r.height() - full.height()).max(0.0))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if fill {
+            if let Doc::Pdf(p) = &mut reader.doc {
+                if reader.fill_spread != Some(cur_spread) {
+                    // pliego nuevo: arriba si avanzas, abajo si retrocedes
+                    let back = reader.fill_spread.is_some_and(|s| s > cur_spread);
+                    p.pan.y = if back {
+                        -overflow / 2.0
+                    } else {
+                        overflow / 2.0
+                    };
+                    reader.fill_spread = Some(cur_spread);
+                }
+                if p.zoom <= 1.01 {
+                    p.pan.x = 0.0;
+                }
+                p.pan.y = p.pan.y.clamp(-overflow / 2.0, overflow / 2.0);
+                pan_cell.set(p.pan);
+            }
+            g = geo(cur_spread);
+        }
         // ---- PDF en desplazamiento continuo
         if scroll_mode {
             if let Some(t) = reader.turn.take() {
@@ -1882,7 +1946,7 @@ impl App {
             let mut push = |p: Option<usize>, rect_h: f32, pdf: &PdfState| {
                 if let Some(p) = p {
                     let (w, h) = pdf.sizes[p];
-                    let ch = if settings.pdf_crop {
+                    let ch = if crop_on {
                         pdf.crops.get(&p).map(|c| c.height()).unwrap_or(1.0)
                     } else {
                         1.0
@@ -2072,7 +2136,33 @@ impl App {
         if !zoomed && !scroll_mode {
             // rueda / gesto de dos dedos
             if resp.hovered() && reader.turn.is_none() {
-                reader.scroll_acc += input.smooth_scroll_delta;
+                let mut delta = input.smooth_scroll_delta;
+                // página más alta que la pantalla: la rueda la desplaza; al llegar al borde pasa página
+                if overflow > 0.5 {
+                    let kd = if input.key_pressed(Key::ArrowDown) {
+                        -120.0
+                    } else if input.key_pressed(Key::ArrowUp) {
+                        120.0
+                    } else {
+                        0.0
+                    };
+                    if let Doc::Pdf(p) = &mut reader.doc {
+                        let dy = delta.y + kd;
+                        let lim = overflow / 2.0;
+                        let np = p.pan.y + dy;
+                        if np > lim || np < -lim {
+                            let at_edge = (dy < 0.0 && p.pan.y <= -lim + 0.5)
+                                || (dy > 0.0 && p.pan.y >= lim - 0.5);
+                            p.pan.y = np.clamp(-lim, lim);
+                            delta.y = if at_edge { dy } else { 0.0 };
+                        } else {
+                            p.pan.y = np;
+                            delta.y = 0.0;
+                        }
+                        pan_cell.set(p.pan);
+                    }
+                }
+                reader.scroll_acc += delta;
                 if input.smooth_scroll_delta == Vec2::ZERO && input.time - reader.last_turn > 0.3 {
                     reader.scroll_acc *= 0.8;
                 }
@@ -2330,6 +2420,12 @@ impl App {
         }
 
         // ---- dibujo
+        if fill {
+            if let Doc::Pdf(p) = &reader.doc {
+                pan_cell.set(p.pan);
+            }
+            g = geo(sp.of(reader.page));
+        }
         let cur_spread = sp.of(reader.page);
         let (statics_l, statics_r, sheet): (
             Option<(usize, Rect)>,
@@ -2413,7 +2509,7 @@ impl App {
                         24,
                     ));
                     if let Some((t, _)) = pdf.tex.get(&page) {
-                        let uv = if settings.pdf_crop {
+                        let uv = if crop_on {
                             pdf.crops
                                 .get(&page)
                                 .copied()
@@ -3445,6 +3541,7 @@ impl App {
                             if is_pdf {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("PDF").strong());
+                                ui.checkbox(&mut s.pdf_fill, "Pantalla completa de borde a borde (ajustar al ancho)");
                                 ui.checkbox(&mut s.pdf_crop, "Recortar márgenes blancos");
                                 ui.checkbox(&mut s.pdf_scroll, "Desplazamiento continuo (sin pasar página)");
                             }
