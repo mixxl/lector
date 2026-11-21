@@ -278,6 +278,7 @@ struct Reader {
     scroll_y: f32,
     scroll_page: Option<usize>,
     fill_spread: Option<usize>,
+    edge_since: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -523,6 +524,7 @@ impl App {
             scroll_y: 0.0,
             scroll_page: None,
             fill_spread: None,
+            edge_since: None,
         });
     }
 
@@ -1784,6 +1786,7 @@ impl App {
                         overflow / 2.0
                     };
                     reader.fill_spread = Some(cur_spread);
+                    reader.edge_since = None;
                 }
                 if p.zoom <= 1.01 {
                     p.pan.x = 0.0;
@@ -2049,16 +2052,50 @@ impl App {
         };
 
         if !typing {
-            if input.key_pressed(Key::ArrowRight)
-                || input.key_pressed(Key::Space)
-                || input.key_pressed(Key::PageDown)
-            {
+            // PDF de borde a borde: ↓ / espacio bajan por la página; al final, siguiente página arriba
+            let page_scroll = fill && overflow > 0.5 && reader.turn.is_none();
+            let mut step = 0.0f32;
+            if page_scroll {
+                if input.key_pressed(Key::ArrowDown) {
+                    step = 140.0;
+                }
+                if input.key_pressed(Key::Space) || input.key_pressed(Key::PageDown) {
+                    step = full.height() * 0.85;
+                }
+                if input.key_pressed(Key::ArrowUp) {
+                    step = -140.0;
+                }
+                if input.key_pressed(Key::PageUp) {
+                    step = -full.height() * 0.85;
+                }
+            }
+            if step != 0.0 {
+                let lim = overflow / 2.0;
+                let mut turn_dir = None;
+                if let Doc::Pdf(p) = &mut reader.doc {
+                    if step > 0.0 && p.pan.y <= -lim + 0.5 {
+                        turn_dir = Some(true);
+                    } else if step < 0.0 && p.pan.y >= lim - 0.5 {
+                        turn_dir = Some(false);
+                    } else {
+                        p.pan.y = (p.pan.y - step).clamp(-lim, lim);
+                        pan_cell.set(p.pan);
+                    }
+                }
+                if let Some(fwd) = turn_dir {
+                    start_turn(reader, fwd);
+                }
+            }
+            let fwd_keys = input.key_pressed(Key::ArrowRight)
+                || (!page_scroll
+                    && (input.key_pressed(Key::Space) || input.key_pressed(Key::PageDown)));
+            let back_keys = input.key_pressed(Key::ArrowLeft)
+                || input.key_pressed(Key::Backspace)
+                || (!page_scroll && input.key_pressed(Key::PageUp));
+            if fwd_keys {
                 start_turn(reader, true);
             }
-            if input.key_pressed(Key::ArrowLeft)
-                || input.key_pressed(Key::PageUp)
-                || input.key_pressed(Key::Backspace)
-            {
+            if back_keys {
                 start_turn(reader, false);
             }
             if input.key_pressed(Key::Home) {
@@ -2138,28 +2175,35 @@ impl App {
             if resp.hovered() && reader.turn.is_none() {
                 let mut delta = input.smooth_scroll_delta;
                 // página más alta que la pantalla: la rueda la desplaza; al llegar al borde pasa página
-                if overflow > 0.5 {
-                    let kd = if input.key_pressed(Key::ArrowDown) {
-                        -120.0
-                    } else if input.key_pressed(Key::ArrowUp) {
-                        120.0
-                    } else {
-                        0.0
-                    };
+                if fill && overflow > 0.5 {
+                    // la página no se mueve sola: solo la rueda/trackpad en vertical la recorre
+                    delta.x = 0.0;
+                    if time - reader.last_turn < 0.6 {
+                        // inercia del gesto anterior: la página nueva se queda fija arriba
+                        delta.y = 0.0;
+                        reader.edge_since = None;
+                    }
                     if let Doc::Pdf(p) = &mut reader.doc {
-                        let dy = delta.y + kd;
+                        let dy = delta.y;
                         let lim = overflow / 2.0;
-                        let np = p.pan.y + dy;
-                        if np > lim || np < -lim {
-                            let at_edge = (dy < 0.0 && p.pan.y <= -lim + 0.5)
-                                || (dy > 0.0 && p.pan.y >= lim - 0.5);
-                            p.pan.y = np.clamp(-lim, lim);
-                            delta.y = if at_edge { dy } else { 0.0 };
+                        let at_bottom = p.pan.y <= -lim + 0.5;
+                        let at_top = p.pan.y >= lim - 0.5;
+                        if (dy < 0.0 && at_bottom) || (dy > 0.0 && at_top) {
+                            // en el borde: hay que hacer una pausa y volver a desplazar para pasar
+                            let since = *reader.edge_since.get_or_insert(time);
+                            delta.y = if time - since > 0.45 { dy } else { 0.0 };
                         } else {
-                            p.pan.y = np;
+                            if dy != 0.0 {
+                                reader.edge_since = None;
+                                reader.scroll_acc = Vec2::ZERO;
+                            }
+                            p.pan.y = (p.pan.y + dy).clamp(-lim, lim);
                             delta.y = 0.0;
                         }
                         pan_cell.set(p.pan);
+                    }
+                    if delta == Vec2::ZERO {
+                        reader.scroll_acc = Vec2::ZERO;
                     }
                 }
                 reader.scroll_acc += delta;
@@ -2941,11 +2985,7 @@ impl App {
                                             );
                                         }
                                         if ui
-                                            .button(if double {
-                                                "Ver una página"
-                                            } else {
-                                                "Ver dos páginas"
-                                            })
+                                            .button(if double { "1 página" } else { "2 páginas" })
                                             .on_hover_text(
                                                 "Cambiar entre lectura a una o dos páginas",
                                             )
@@ -2964,12 +3004,9 @@ impl App {
                                         if ui
                                             .selectable_label(
                                                 reader.tts_on,
-                                                if reader.tts_on {
-                                                    "Parar lectura"
-                                                } else {
-                                                    "Leer en voz alta"
-                                                },
+                                                if reader.tts_on { "Parar" } else { "Leer" },
                                             )
+                                            .on_hover_text("Leer en voz alta")
                                             .clicked()
                                         {
                                             if reader.tts_on {
@@ -3011,15 +3048,22 @@ impl App {
                                                 }
                                             }
                                         }
-                                        ui.add_space(ui.available_width() / 2.0 - 160.0);
-                                        let mut t = title.clone();
-                                        if t.chars().count() > 50 {
-                                            t = t.chars().take(48).collect::<String>() + "…";
+                                        // el título ocupa solo el hueco libre, recortado si no cabe
+                                        let w = ui.available_width();
+                                        if w > 60.0 {
+                                            ui.add_sized(
+                                                [w, 24.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(title.clone()).font(
+                                                        FontId::new(
+                                                            16.0,
+                                                            FontFamily::Name("serif-b".into()),
+                                                        ),
+                                                    ),
+                                                )
+                                                .truncate(),
+                                            );
                                         }
-                                        ui.label(egui::RichText::new(t).font(FontId::new(
-                                            16.0,
-                                            FontFamily::Name("serif-b".into()),
-                                        )));
                                     },
                                 );
                             });
