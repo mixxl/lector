@@ -1748,8 +1748,10 @@ impl App {
                 let w_avail = full.width();
                 let cy = full.center().y + pan.y;
                 let cx = full.center().x + pan.x;
+                // la página entera siempre visible: lo más grande posible sin salirse
+                let h_avail = full.height() - 4.0;
                 return if double {
-                    let h = (w_avail / 2.0 / al.max(ar)) * zoom;
+                    let h = (w_avail / 2.0 / al.max(ar)).min(h_avail) * zoom;
                     let top = cy - h / 2.0;
                     Geo {
                         spine: cx,
@@ -1758,7 +1760,7 @@ impl App {
                         right: r.map(|_| Rect::from_min_size(pos2(cx, top), vec2(ar * h, h))),
                     }
                 } else {
-                    let h = (w_avail / ar) * zoom;
+                    let h = (w_avail / ar).min(h_avail) * zoom;
                     let w = ar * h;
                     Geo {
                         spine: cx - w / 2.0,
@@ -3631,7 +3633,7 @@ impl App {
                             if is_pdf {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("PDF").strong());
-                                ui.checkbox(&mut s.pdf_fill, "Pantalla completa de borde a borde (ajustar al ancho)");
+                                ui.checkbox(&mut s.pdf_fill, "Página completa lo más grande posible (sin márgenes blancos)");
                                 ui.checkbox(&mut s.pdf_crop, "Recortar márgenes blancos");
                                 ui.checkbox(&mut s.pdf_scroll, "Desplazamiento continuo (sin pasar página)");
                             }
